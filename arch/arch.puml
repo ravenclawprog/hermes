@@ -1,0 +1,33 @@
+@startuml HermesBaseArch
+package "Client Zone" #ff7755{
+    rectangle "hermes-cli" as CLI {
+    
+    }
+    rectangle "System Editor (Vim/ Nano)" as SE{
+    
+    }
+}
+
+
+package "Server Zone" #77e077{
+    rectangle "hermes-document-service" as HDS {
+    
+    }
+    rectangle "hermes-notification-service" as HNS {
+    
+    }
+    database "PostgreSQL" as PSQL 
+    queue "Apache Kafka \n(Topics:\ndoc-events,\n comment-events)" as AK 
+    database "Redis \n(Publish/Subscriber;\nUser Status)" as RED 
+
+}
+
+CLI -down-> SE:run process
+CLI -> HDS:REST/grpc
+CLI -> HNS:Async websocket
+
+HDS -down-> PSQL:ACID transaction
+HDS -down.> AK:Transactional outbox\n workers
+AK -down-> HNS:Consumer Group
+HNS  <-right-> RED:Routing
+@enduml
