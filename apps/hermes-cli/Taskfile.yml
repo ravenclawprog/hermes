@@ -1,0 +1,42 @@
+version: '3'
+
+vars:
+  BINARY_NAME: hermes
+
+tasks:
+  fmt:
+    desc: Formatting
+    cmds:
+      - go fmt ./...
+
+  vet:
+    desc: Static analyzer
+    cmds:
+      - go vet ./...
+
+  test:
+    desc: Run unit tests
+    deps: [vet]
+    cmds:
+      - go test -v -race ./...
+
+  build:
+    desc: Build binary
+    deps: [fmt]
+    generates:
+      - "bin/{{.BINARY_NAME}}"
+    cmds:
+      - go build -o bin/{{.BINARY_NAME}} main.go
+      - echo "🚀 CLI successfully compiled apps/hermes-cli/{{.BINARY_NAME}}"
+
+  run:
+    desc: Fust run example - task run -- doc list
+    deps: [build]
+    cmds:
+      - bin/{{.BINARY_NAME}} {{.CLI_ARGS}}
+
+  clean:
+    desc: Delete CLI
+    cmds:
+      - rm -rf bin/ 
+      - echo " Cleaning done "
