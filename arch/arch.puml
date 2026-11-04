@@ -17,7 +17,7 @@ package "Server Zone" #77e077{
     
     }
     database "PostgreSQL" as PSQL 
-    queue "Apache Kafka \n(Topics:\ndoc-events,\n comment-events)" as AK 
+    queue "Apache Kafka \n(Topics:\ndoc-events)" as AK
     database "Redis \n(Publish/Subscriber;\nUser Status)" as RED 
 
 }

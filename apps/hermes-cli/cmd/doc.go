@@ -43,9 +43,28 @@ var editCmd = &cobra.Command{
 		fmt.Fprintln(cmd.OutOrStdout(), updatedContent)
 	},
 }
+var readCmd = &cobra.Command{
+	Use:   "read [document_id]",
+	Short: "Read and display document content",
+	Args:  cobra.ExactArgs(1),
+	RunE: func(cmd *cobra.Command, args []string) error {
+		docID := args[0]
+		fmt.Fprintf(cmd.OutOrStdout(), "Fetching document %s...\n", docID)
+
+		stubRemoteContent := "Hello, Hermes! This is the document content."
+		stubVersion := int64(1)
+
+		fmt.Fprintln(cmd.OutOrStdout(), "\n--- Document Content ---")
+		fmt.Fprintln(cmd.OutOrStdout(), stubRemoteContent)
+		fmt.Fprintf(cmd.OutOrStdout(), "------------------------\n[Version: %d]\n", stubVersion)
+
+		return nil
+	},
+}
 
 func init() {
 	docCmd.AddCommand(listCmd)
 	docCmd.AddCommand(editCmd)
+	docCmd.AddCommand(readCmd)
 	rootCmd.AddCommand(docCmd)
 }

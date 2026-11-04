@@ -1,0 +1,47 @@
+@startuml notifications_inbox
+title Inbox and notification preferences
+autonumber
+actor "User" as User
+participant "hermes (CLI / TUI)" as Client
+participant "hermes-notification-service" as HNS
+database "PostgreSQL" as DB
+
+== Update notification preferences ==
+User -> Client : Configure users / workspaces / documents category
+Client -> HNS : UpdateNotificationPreferences(category, enabled, session)
+HNS -> DB : Save preferences for authenticated user only
+HNS --> Client : Updated preferences
+note over HNS
+  Preferences affect future notifications, not events or existing inbox items.
+end note
+
+== Read inbox from CLI or TUI ==
+User -> Client : Open inbox or run hermes inbox list
+Client -> HNS : ListInbox(category?, unread_only?, cursor), UnreadCount
+HNS -> DB : Select recipient inbox; hide inaccessible targets\nexcept minimal deletion/removal notices
+HNS --> Client : Items, cursor, mark-all boundary and unread count
+Client --> User : Show inbox
+
+== Open a notification target ==
+User -> Client : Open notification
+Client -> HNS : GetTarget(notification_id, session)
+HNS -> DB : Validate recipient and current target permissions
+alt Target accessible
+  HNS --> Client : Document, invitation or profile
+  Client -> HNS : MarkRead(notification_id)
+  HNS -> DB : Set read_at if not already set
+else Target deleted or access revoked
+  HNS --> Client : Target unavailable; no content disclosed
+end
+
+== Mark notifications as read ==
+User -> Client : Mark one item or all listed items as read
+Client -> HNS : MarkRead(id) / MarkAllRead(list_boundary)
+HNS -> DB : Validate recipient; update read_at up to the boundary
+HNS --> Client : Updated unread count
+note over Client, DB
+  New arrivals beyond the boundary remain unread.
+  TUI polls for updates; one-shot CLI exits.
+  Inbox items persist even when no client is running.
+end note
+@enduml

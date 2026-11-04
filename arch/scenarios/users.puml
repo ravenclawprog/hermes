@@ -1,0 +1,91 @@
+@startuml users
+title User scenarios
+autonumber
+actor "User" as User
+participant "hermes (CLI / TUI)" as Client
+participant "hermes-document-service" as HDS
+database "PostgreSQL" as DB
+
+== Create an account ==
+User -> Client : Register (username, display_name, email, credentials)
+Client -> HDS : Register(...)
+HDS -> DB : Validate input and username/email uniqueness
+alt Invalid input or duplicate identity
+  HDS --> Client : Validation error; no entities created
+else Valid input
+  group Single transaction
+    HDS -> DB : Create active user, personal workspace and owner membership
+    HDS -> DB : Outbox: UserCreated, WorkspaceCreated, WorkspaceMemberAdded
+  end
+  HDS --> Client : Profile and personal workspace
+end
+note over HDS, DB
+  Authentication and initial email verification are to be specified.
+  Credentials are excluded from profiles and events.
+end note
+
+== Read a profile ==
+User -> Client : Open my profile
+Client -> HDS : GetSelf(session)
+HDS -> DB : Validate active session; read profile
+HDS --> Client : Private profile and version
+note over HDS
+  GetPublicProfile exposes only public fields
+  to users sharing a workspace.
+end note
+
+== Update a profile ==
+User -> Client : Change display_name, username or email
+Client -> HDS : UpdateSelf(changes, expected_version, session)
+HDS -> DB : Validate version, format and uniqueness
+alt Invalid input or stale version
+  HDS --> Client : Error or conflict; no changes
+else Email change requested
+  HDS -> DB : Store pending email verification request
+  HDS --> Client : Verification required; previous email remains active
+  User -> Client : Verify new email
+  Client -> HDS : ConfirmEmail(one_time_confirmation)
+  group Single transaction
+    HDS -> DB : Validate confirmation and uniqueness; update email and version
+    HDS -> DB : Outbox: UserUpdated
+  end
+  HDS --> Client : Updated profile or verification error
+else Username or display_name change
+  group Single transaction
+    HDS -> DB : Update profile using expected_version
+    HDS -> DB : Outbox: UserUpdated only if fields changed
+  end
+  HDS --> Client : Profile and current version
+end
+note over HDS
+  Username/email changes notify the owner with ProfileChanged
+  if the users category is enabled. Display name changes do not notify.
+end note
+
+== Delete an account ==
+User -> Client : Delete my account
+Client -> HDS : GetDeletionBlockers(session)
+HDS -> DB : Find shared workspaces owned by this user
+alt Shared workspaces are still owned
+  HDS --> Client : Blocking workspaces
+  Client --> User : Transfer ownership or delete these workspaces first
+else No ownership blockers
+  Client --> User : Explain personal document loss; request identity confirmation
+  User -> Client : Confirm account deletion
+  Client -> HDS : DeleteSelf(confirmation, expected_version, session)
+  group Single transaction; recheck all conditions
+    HDS -> DB : Prevent concurrent ownership transfer; validate constraints
+    HDS -> DB : Mark user deleted; revoke sessions
+    HDS -> DB : Close personal workspace and documents; remove memberships/subscriptions
+    HDS -> DB : Revoke pending invitations involving this user
+    HDS -> DB : Outbox: UserDeleted, WorkspaceDeleted,\nWorkspaceMemberRemoved, WorkspaceInvitationRevoked
+  end
+  HDS --> Client : Deleted or conflict if conditions changed
+  Client -> Client : Clear local session only after successful deletion
+  Client --> User : Show result
+end
+note over HDS, DB
+  Shared documents retain attribution as "Deleted user".
+  Physical deletion and anonymization policies are to be specified.
+end note
+@enduml

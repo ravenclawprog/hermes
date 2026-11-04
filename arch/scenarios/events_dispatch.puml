@@ -1,0 +1,45 @@
+@startuml events_dispatch
+title Internal events and inbox creation
+autonumber
+actor "User" as User
+participant "hermes (CLI / TUI)" as Client
+participant "hermes-document-service" as HDS
+database "PostgreSQL" as DB
+
+participant "Outbox worker\n(hermes-document-service)" as Publisher
+queue "Apache Kafka" as Bus
+participant "hermes-notification-service" as Handler
+== Change domain state ==
+User -> Client : Perform a modifying operation
+Client -> HDS : Command(session, expected_version)
+group Single transaction
+  HDS -> DB : Check permissions, constraints and version
+  HDS -> DB : Save domain changes and outbox events
+end
+HDS --> Client : Success after commit or error without events
+
+== Publish asynchronously ==
+Publisher -> DB : Read unpublished outbox events
+Publisher -> Bus : Publish(event_id, type, schema_version, payload)
+Bus --> Publisher : Acknowledgement
+Publisher -> DB : Mark published after acknowledgement
+note over Publisher, Bus
+  A crash between publication and marking may cause redelivery.
+end note
+
+== Convert events into notifications ==
+Bus -> Handler : Internal event
+Handler -> Handler : Select users / workspaces / documents policy
+Handler -> DB : Read recipients, preferences and current permissions
+Handler -> Handler : Exclude deleted users, disabled categories and actor\n(except ProfileChanged); merge reasons per recipient
+loop For each eligible recipient
+  Handler -> DB : Transaction: insert notification\nUNIQUE(recipient_id, source_event_id); duplicate is a no-op
+end
+Handler -> Bus : Acknowledge after all results are persisted
+note over Handler, DB
+  Retry failures without losing or duplicating inbox items.
+  Events without user relevance create no notifications.
+  WorkspaceDeleted, WorkspaceMemberRemoved and DocumentDeleted
+  permit minimal notices under their specific recipient policies.
+end note
+@enduml

@@ -1,0 +1,109 @@
+@startuml documents
+title Document scenarios
+autonumber
+actor "User" as User
+participant "hermes (CLI / TUI)" as Client
+participant "hermes-document-service" as HDS
+database "PostgreSQL" as DB
+
+== Create a document ==
+User -> Client : Create document (workspace_id, title, Markdown)
+Client -> HDS : CreateDocument(..., session)
+alt Workspace unavailable or role below editor
+  HDS --> Client : Denied; no changes
+else Access allowed
+  group Single transaction
+    HDS -> DB : Check membership and non-empty title
+    HDS -> DB : Create document with version=1 and author attribution
+    HDS -> DB : Outbox: DocumentCreated
+  end
+  HDS --> Client : Document and version
+end
+note over HDS
+  Personal documents belong to the personal workspace.
+  DocumentCreated does not notify all workspace members.
+end note
+
+== List and search documents ==
+User -> Client : List or search available documents
+Client -> HDS : ListDocuments / SearchDocuments(workspace_id?, query, cursor)
+HDS -> DB : Select active documents in accessible workspaces only
+HDS --> Client : IDs, titles and next cursor
+Client --> User : Show results
+
+== Read and edit a document ==
+User -> Client : Read or edit document
+Client -> HDS : GetDocument(id, session)
+HDS -> DB : Validate membership and active document
+HDS --> Client : title, content, version or unavailable
+opt Edit an accessible document
+  Client -> Client : Keep original version; open external editor
+  User -> Client : Finish editing
+  Client -> Client : Read changes and keep local recovery copy
+  Client -> HDS : UpdateDocument(id, title, content, expected_version)
+  group Single transaction
+    HDS -> DB : Check edit permission, document status and expected_version
+    alt Permission lost or document unavailable
+      HDS --> Client : Access error; no changes
+    else Version mismatch
+      HDS --> Client : Conflict; no changes
+    else Matching version and changed content
+      HDS -> DB : Update document and increment version
+      HDS -> DB : Outbox: DocumentUpdated
+      HDS --> Client : Saved; new version after commit
+    else Matching version and unchanged content
+      HDS --> Client : Current version; no update event
+    end
+  end
+  alt Save succeeded
+    Client --> User : Show saved or unchanged result
+  else Conflict, access error or network failure
+    Client --> User : Show error and path to local recovery copy
+    opt User chooses conflict resolution
+      Client -> HDS : GetDocument(id, session)
+      HDS --> Client : Latest version if still accessible
+      Client --> User : Offer manual comparison and another edit
+    end
+  end
+end
+note over Client
+  TUI refreshes the inbox after the editor exits.
+  An unknown network outcome is checked by reading the document.
+  Never overwrite a newer version without checking it.
+end note
+
+== Subscribe or unsubscribe ==
+User -> Client : Subscribe to document changes or unsubscribe
+Client -> HDS : SubscribeDocument / UnsubscribeDocument
+HDS -> DB : Transaction: check access; update subscription;\noutbox DocumentSubscriptionCreated/Deleted only if changed
+HDS --> Client : Current subscription state
+note over HDS, DB
+  Subscription grants no access and is removed when access is lost.
+  Repeating the same state does not create another event.
+end note
+
+== Delete a document ==
+User -> Client : Delete document
+Client -> HDS : GetDocument(id, session)
+HDS --> Client : Document and version after access check
+Client --> User : Request deletion confirmation
+User -> Client : Confirm
+Client -> HDS : DeleteDocument(id, expected_version, confirmation)
+group Single transaction
+  HDS -> DB : Check editor/admin/owner, active status and version
+  alt Checks passed
+    HDS -> DB : Capture subscriber IDs; soft-delete document
+    HDS -> DB : Remove subscriptions
+    HDS -> DB : Outbox: DocumentDeleted with subscriber IDs
+  else Access denied, deleted document or stale version
+    HDS -> DB : No changes
+  end
+end
+HDS --> Client : Deleted, unavailable or conflict
+Client --> User : Show result
+note over HDS
+  DocumentDeleted sends subscribers with current membership a minimal notice.
+  The deleted document cannot be opened.
+  Other notifications targeting the inaccessible document are hidden.
+end note
+@enduml

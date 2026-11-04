@@ -1,0 +1,47 @@
+@startuml
+autonumber
+skinparam boxPadding 10
+skinparam participantPadding 10
+
+actor "User (CLI)" as User
+participant "hermes-cli" as CLI
+box "Server Zone" #LightBlue
+participant "document-service" as DocServ
+database "PostgreSQL" as DB
+participant "Kafka" as Broker
+end box
+
+User -> CLI : hermes doc edit <doc_id>
+activate CLI
+
+CLI -> DocServ : gRPC: GetDocument(doc_id)
+activate DocServ
+DocServ -> DB : SELECT * FROM docs WHERE id=doc_id
+DB --> DocServ : Return Doc (Text, Version=5)
+DocServ --> CLI : Response (Text, Version=5)
+deactivate DocServ
+
+CLI -> CLI : OpenInSystemEditor(Text)
+note over CLI: User edit text at\n Vim/Nano and save file
+
+User -> CLI : :wq (Save and exit)
+
+CLI -> DocServ : gRPC: UpdateDocument(doc_id, NewText, Version=5)
+activate DocServ
+
+DocServ -> DB : UPDATE docs SET text=NewText, version=version+1\nWHERE id=doc_id AND version=5
+note over DB: Version check (Optimistic Lock)
+
+alt Successfull change (Version same)
+    DB --> DocServ : Rows Affected = 1
+    DocServ -> DB : Insert Into Transactional Outbox (Event: DOC_UPDATED)
+    DocServ --> CLI : gRPC: Success (New Version=6)
+    CLI -> User : Print "Document updated successfully!"
+else COnflict of edit (Version changed by somebody else)
+    DB --> DocServ : Rows Affected = 0
+    DocServ --> CLI : gRPC: Error (StatusAborted / Conflict)
+    CLI -> User : Print "Conflict! Document was changed by another user."
+end
+deactivate DocServ
+deactivate CLI
+@enduml

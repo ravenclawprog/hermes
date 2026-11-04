@@ -1,0 +1,123 @@
+@startuml workspaces
+title Workspace scenarios
+autonumber
+actor "User" as User
+participant "hermes (CLI / TUI)" as Client
+participant "hermes-document-service" as HDS
+database "PostgreSQL" as DB
+
+== Create a shared workspace ==
+User -> Client : Create workspace (name, description)
+Client -> HDS : CreateWorkspace(..., session)
+group Single transaction
+  HDS -> DB : Validate active user
+  HDS -> DB : Create shared workspace and owner membership
+  HDS -> DB : Outbox: WorkspaceCreated, WorkspaceMemberAdded
+end
+HDS --> Client : Workspace and version or validation error
+
+== List and select workspaces ==
+User -> Client : List available workspaces
+Client -> HDS : ListWorkspaces(session, cursor)
+HDS -> DB : Find active workspaces by membership
+HDS --> Client : Results including personal workspace; next cursor
+User -> Client : Select workspace
+Client -> HDS : GetWorkspace(id, session)
+HDS -> DB : Check current membership
+HDS --> Client : Workspace or unavailable
+Client -> Client : Save current workspace_id locally on success
+note over Client, DB
+  Selection changes local context, not membership.
+  Every subsequent operation checks access again.
+end note
+
+== Update workspace settings ==
+User -> Client : Change name or description
+Client -> HDS : UpdateWorkspace(id, changes, expected_version, session)
+group Single transaction
+  HDS -> DB : Check owner/admin role and version; personal requires owner
+  HDS -> DB : Update settings; outbox WorkspaceUpdated only if changed
+end
+HDS --> Client : Current version or permission/version error
+
+== Invite a member ==
+User -> Client : Invite an existing user
+Client -> HDS : InviteMember(workspace_id, invitee_id, role)
+group Single transaction
+  HDS -> DB : Validate shared workspace, inviter permissions and active invitee
+  HDS -> DB : Reject existing membership or duplicate pending invitation
+  HDS -> DB : Create invitation with expiry; outbox WorkspaceInvitationCreated
+end
+HDS --> Client : Invitation or error
+note over HDS, DB
+  Invitee receives an inbox item if the workspaces category is enabled.
+  Owner may invite admin/editor/viewer; admin may invite editor/viewer.
+end note
+
+== Accept or decline an invitation ==
+User -> Client : Accept or decline my invitation
+Client -> HDS : RespondToInvitation(id, decision, session)
+group Single transaction
+  HDS -> DB : Check recipient, pending status, expires_at and active workspace
+  alt Accept valid invitation
+    HDS -> DB : Create membership; mark invitation accepted
+    HDS -> DB : Outbox: WorkspaceInvitationAccepted, WorkspaceMemberAdded
+  else Decline valid invitation
+    HDS -> DB : Mark invitation declined; outbox WorkspaceInvitationDeclined
+  end
+end
+HDS --> Client : Result or invalid/expired invitation error
+
+== Revoke or expire an invitation ==
+User -> Client : Revoke a pending invitation
+Client -> HDS : RevokeInvitation(id, session)
+HDS -> DB : Transaction: check inviter management rights and pending status;\nmark revoked; outbox WorkspaceInvitationRevoked
+HDS --> Client : Result or error
+note over HDS, DB
+  Expiration is performed by the server after expires_at:
+  pending becomes expired with WorkspaceInvitationExpired.
+  Revocation, acceptance and expiration must be serialized.
+end note
+
+== Change roles, remove members or leave ==
+User -> Client : Change role, remove member or leave workspace
+Client -> HDS : ChangeRole / RemoveMember / LeaveWorkspace
+HDS -> DB : Validate permissions; protect owner; reject personal workspace
+HDS -> DB : Transaction: update membership; remove inaccessible subscriptions;\noutbox WorkspaceMemberRoleChanged or WorkspaceMemberRemoved
+HDS --> Client : Result or error
+
+== Transfer ownership ==
+User -> Client : Transfer ownership to an active member
+Client -> HDS : TransferOwnership(id, new_owner_id, expected_version)
+HDS -> DB : Transaction: check current owner and version;\nnew member becomes owner, previous owner becomes admin;\nupdate owner_id and version; outbox WorkspaceOwnershipTransferred
+HDS --> Client : Result or conflict
+note over HDS
+  Failed checks roll back the entire operation.
+  Only owner manages admins; admin cannot change owner/admin membership.
+  Personal workspace does not support invitations or ownership transfer.
+end note
+
+== Delete a shared workspace ==
+User -> Client : Delete workspace
+Client --> User : Explain consequences and request confirmation
+User -> Client : Confirm
+Client -> HDS : DeleteWorkspace(id, expected_version, confirmation, session)
+alt Personal workspace, non-owner or stale version
+  HDS --> Client : Denied or conflict; no changes
+else Valid request
+  group Single transaction; recheck constraints
+    HDS -> DB : Check owner, kind and version
+    HDS -> DB : Capture former member IDs for notifications
+    HDS -> DB : Soft-delete workspace; close documents and memberships
+    HDS -> DB : Revoke invitations; remove subscriptions
+    HDS -> DB : Outbox: WorkspaceDeleted, WorkspaceInvitationRevoked\nwith minimal recipient information
+  end
+  HDS --> Client : Deleted
+  Client -> Client : Clear local selection of deleted workspace
+end
+Client --> User : Show result
+note over HDS, DB
+  Former members may receive only a minimal deletion notice.
+  Documents and previous document notifications are inaccessible.
+end note
+@enduml
