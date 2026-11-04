@@ -1,0 +1,118 @@
+@startuml auth
+title Authentication and logout with one session token
+autonumber
+actor "User" as User
+participant "hermes (CLI / TUI)" as Client
+database "Local credential store" as Local
+participant "hermes-document-service" as HDS
+participant "hermes-notification-service" as HNS
+database "PostgreSQL" as DB
+
+== Sign in ==
+User -> Client : hermes auth login
+Client --> User : Request credentials using the selected authentication method
+User -> Client : Provide credentials securely
+Client -> HDS : Authenticate(credentials) over TLS
+HDS -> DB : Find active account and verify credentials
+alt Invalid credentials or inactive account
+  HDS --> Client : Authentication failed; no session token
+  Client --> User : Show authentication error
+else Valid credentials
+  HDS -> HDS : Generate a cryptographically random opaque token
+  HDS -> DB : Create session (id, user_id, token_hash,\ncreated_at, expires_at, revoked_at=null)
+  DB --> HDS : Session persisted
+  HDS --> Client : Session token and expires_at
+  Client -> Local : Securely store token, expiry and server identity
+  alt Local storage succeeded
+    Local --> Client : Saved
+    Client --> User : Signed in
+  else Local storage failed
+    Local --> Client : Storage error
+    Client -> HDS : Logout(token); attempt to revoke newly created session
+    HDS -> DB : Mark session revoked if request arrives
+    Client --> User : Sign-in not saved; report cleanup outcome
+  end
+end
+note over Client, DB
+  Exactly one token: no access/refresh token pair.
+  The server stores only its hash; the raw token is a bearer credential.
+  Never log the token or credentials; do not pass secrets as CLI arguments.
+  Credential method and session lifetime are to be specified.
+end note
+
+== Execute a short command or open TUI ==
+User -> Client : Run a protected command or open hermes
+Client -> Local : Read session for the selected server
+alt No local token
+  Local --> Client : Not signed in
+  Client --> User : Ask user to run hermes auth login
+else Token available
+  Local --> Client : Token and expiry
+  Client -> HDS : Protected request with session token over TLS
+  HDS -> DB : Find session by token hash; check expiry,\nrevocation and active user
+  alt Session valid
+    HDS -> DB : Check operation permissions and execute request
+    HDS --> Client : Result or permission denied
+    Client --> User : Display result
+  else Session expired, revoked or unknown
+    HDS --> Client : Unauthenticated
+    Client -> Local : Remove rejected token if it is still the stored token
+    Client --> User : Sign in again; no automatic token refresh
+  end
+end
+note over Client, HDS
+  Ending a command or closing TUI does not revoke the session.
+  Permission denied does not invalidate an authenticated session.
+  A network error does not remove a stored token.
+end note
+
+== Authenticate requests to notification service ==
+Client -> HNS : Inbox request with the same token over TLS
+HNS -> HDS : ValidateSession(token) over authenticated internal TLS
+HDS -> DB : Check token hash, expiry, revocation and active user
+alt Session valid
+  HDS --> HNS : Authenticated user_id and session expiry
+  HNS -> HNS : Apply recipient and current access checks
+  HNS --> Client : Inbox result or permission denied
+else Session invalid
+  HDS --> HNS : Unauthenticated
+  HNS --> Client : Unauthenticated; sign-in required
+else Validation service unavailable
+  HNS --> Client : Temporarily unavailable; no access granted
+end
+note over HDS, HNS
+  Proposed integration: notification service delegates session validation
+  to document service on each request; no positive validation cache initially.
+  Both services use the same session; notification service issues no token.
+  Workspace permissions are checked separately from authentication.
+end note
+
+== Sign out of the current session ==
+User -> Client : hermes auth logout / Sign out in TUI
+Client -> Local : Read current token
+alt No local token
+  Client --> User : Already signed out locally
+else Token available
+  Local --> Client : Current token
+  Client -> HDS : Logout(token) over TLS
+  alt Server reachable
+    HDS -> DB : Revoke session identified by token hash, if present
+    HDS --> Client : Signed out (also for expired, revoked or unknown token)
+    Client -> Local : Remove this token without deleting a newer login
+    Client --> User : Signed out after local removal succeeds
+  else Server unreachable or outcome unknown
+    Client -> Local : Remove this token without deleting a newer login
+    Client --> User : Signed out locally; server revocation not confirmed
+    note over Client, DB
+      A server session that was not revoked remains valid until expiry.
+      Local deletion alone does not revoke copies of the token.
+    end note
+  end
+end
+note over Client, Local
+  If local deletion fails, report the failure rather than claiming success.
+  Cancel authenticated TUI polling and return to the signed-out screen.
+  Logout affects only this session, not sessions on other devices.
+  Requests already authorized before revocation may finish.
+end note
+@enduml

@@ -20,7 +20,8 @@ else Valid input
   HDS --> Client : Profile and personal workspace
 end
 note over HDS, DB
-  Authentication and initial email verification are to be specified.
+  Sign-in and logout are described in auth.puml.
+  Credential method and initial email verification are to be specified.
   Credentials are excluded from profiles and events.
 end note
 
