@@ -1,0 +1,73 @@
+@startuml HermesCLIDocumentAdapters
+title Document service: operations, contracts and adapters
+top to bottom direction
+skinparam classAttributeIconSize 0
+skinparam nodesep 55
+skinparam ranksep 60
+hide empty members
+class "Auth / Users / Workspaces / Documents" as Operations <<application>>
+interface "AuthRemote / UsersRemote / WorkspacesRemote / DocumentsRemote" as Port
+class "HTTPDocumentClient" as HTTP <<struct>>
+class "GRPCDocumentClient" as GRPC <<struct>>
+class "FakeDocumentClient" as Fake <<test double>>
+class "hermes-document-service" as Server <<external service>>
+Operations -down-> Port : calls injected interface
+Port <|.. HTTP
+Port <|.. GRPC
+Port <|.. Fake
+HTTP -down-> Server : HTTP API
+GRPC -down-> Server : gRPC API
+HTTP -[hidden]right-> GRPC
+GRPC -[hidden]right-> Fake
+note top of Operations
+  main creates one selected adapter and injects it here.
+  main does not forward runtime requests.
+end note
+legend bottom
+  Dashed triangle = implements; solid arrow = calls.
+  Document contracts represent four separate consumer-owned interfaces.
+  Production adapters read the token through SessionStore.
+  HTTP attaches headers; gRPC attaches metadata.
+  Each adapter maps wire DTOs/errors and propagates context/deadlines.
+  No universal transport interface; fake requires no network.
+  Test application behavior with fakes and adapters with protocol test servers.
+  Future live streaming has a separate contract from InboxRemote.
+endlegend
+@enduml
+
+@startuml HermesCLINotificationAdapters
+title Notification service: operations, contracts and adapters
+top to bottom direction
+skinparam classAttributeIconSize 0
+skinparam nodesep 55
+skinparam ranksep 60
+hide empty members
+class "Inbox" as Operations <<application>>
+interface "InboxRemote" as Port
+class "HTTPNotificationClient" as HTTP <<struct>>
+class "GRPCNotificationClient" as GRPC <<struct>>
+class "FakeNotificationClient" as Fake <<test double>>
+class "hermes-notification-service" as Server <<external service>>
+Operations -down-> Port : calls injected interface
+Port <|.. HTTP
+Port <|.. GRPC
+Port <|.. Fake
+HTTP -down-> Server : HTTP API
+GRPC -down-> Server : gRPC API
+HTTP -[hidden]right-> GRPC
+GRPC -[hidden]right-> Fake
+note top of Operations
+  main creates one selected adapter and injects it here.
+  main does not forward runtime requests.
+end note
+legend bottom
+  Dashed triangle = implements; solid arrow = calls.
+  Document contracts represent four separate consumer-owned interfaces.
+  Production adapters read the token through SessionStore.
+  HTTP attaches headers; gRPC attaches metadata.
+  Each adapter maps wire DTOs/errors and propagates context/deadlines.
+  No universal transport interface; fake requires no network.
+  Test application behavior with fakes and adapters with protocol test servers.
+  Future live streaming has a separate contract from InboxRemote.
+endlegend
+@enduml

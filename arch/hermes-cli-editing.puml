@@ -1,0 +1,146 @@
+@startuml HermesCLIEditing
+ title hermes-cli: document editing, recovery and conflicts
+ top to bottom direction
+ skinparam nodesep 45
+ skinparam ranksep 60
+ skinparam classAttributeIconSize 0
+ skinparam packageStyle rectangle
+ hide empty members
+
+package "Presentation" {
+  class "CLI edit command" as CLI <<controller>>
+  class "TUI document screen" as TUI <<controller>>
+}
+package "internal/app" {
+  class "Documents" as Documents <<struct>> {
+    BeginEdit(ctx, documentID): Draft
+    SaveEdit(ctx, draftID): SaveResult
+    CompareLatest(ctx, draftID): Comparison
+    RebaseDraft(ctx, draftID, reviewedVersion): Draft
+    DiscardDraft(ctx, draftID): error
+  }
+  interface "DocumentsRemote" as Remote {
+    Get(ctx, documentID): Document
+    Update(ctx, documentID, title, content, expectedVersion): Document
+  }
+  interface "DraftStore" as Store {
+    Create(ctx, document): Draft
+    Load(ctx, draftID): Draft
+    SetBase(ctx, draftID, reviewedDocument): Draft
+    Delete(ctx, draftID): error
+  }
+}
+package "internal/model" {
+  class "Document" as Doc <<data>> {
+    ID
+    WorkspaceID
+    Title
+    Content
+    Version
+  }
+  class "Draft" as Draft <<data>> {
+    ID
+    ServerIdentity
+    UserID
+    DocumentID
+    BaseVersion
+    BaseTitle / BaseContent
+    WorkingFilePath
+    ProposedTitle
+  }
+  class "SaveResult" as Result <<data>> {
+    outcome: saved / unchanged / conflict / unknown / failed
+    document: optional
+    recoveryPath: optional
+    cleanupError: optional
+  }
+  class "Comparison" as Comparison <<data>> {
+    base: Document snapshot
+    local: draft text and title
+    latest: Document
+  }
+}
+package "internal/editor" {
+  interface "Editor" as Editor {
+    Edit(ctx, workingFilePath): error
+  }
+  class "SystemEditor" as SystemEditor <<struct>>
+}
+package "Adapters" {
+  class "HTTPDocumentClient" as HTTPClient <<struct>>
+  class "GRPCDocumentClient" as GRPCClient <<struct>>
+  class "FileDraftStore" as Files <<struct>>
+}
+
+package "Test doubles (test code only)" {
+  class "FakeDocumentClient" as FakeClient <<struct>>
+}
+
+CLI -down-> Documents
+TUI -down-> Documents
+CLI --> Editor : foreground process
+TUI --> Editor : suspend UI; run editor; resume UI
+Documents -down-> Remote
+Documents -down-> Store
+Documents ..> Result
+Documents ..> Comparison
+Store ..> Draft
+Remote ..> Doc
+HTTPClient ..|> Remote
+GRPCClient ..|> Remote
+FakeClient ..|> Remote
+Files ..|> Store
+SystemEditor ..|> Editor
+Draft --> Doc : base snapshot
+Comparison --> Draft : local revision
+
+note right of Remote
+  Protocol-independent operations using application models/errors.
+  HTTP and gRPC are alternative adapters selected at bootstrap.
+  Tests inject FakeDocumentClient for deterministic error scenarios.
+end note
+note left of Documents
+  BeginEdit:
+  1. Load document and its version from server.
+  2. Persist base snapshot and editable Markdown file.
+  3. Return draft only after local persistence succeeds.
+
+  SaveEdit:
+  1. Load draft metadata and edited file.
+  2. Verify server/account matches the draft.
+  3. Submit changes with BaseVersion.
+  4. Clean up only after confirmed save or explicit discard.
+  No terminal I/O or external editor process in this struct.
+end note
+note right of Editor
+  Edits an existing persistent draft file.
+  Editor failure or cancellation retains the draft.
+  Editor does not upload content or delete recovery files.
+  Presentation decides when terminal ownership changes.
+end note
+note right of Result
+  Conflict: preserve file and offer manual comparison.
+  Unknown network outcome: retain file; inspect latest document.
+  No automatic retry or unconditional overwrite.
+  Lost access: retain file but do not expose new remote content.
+  Cleanup failure after save is reported separately from save failure.
+end note
+note bottom of Comparison
+  CompareLatest retrieves current content only if access still exists.
+  RebaseDraft is explicit after the user reviews/merges against latest:
+  update the base snapshot/version; preserve the working content.
+  Another concurrent update can still cause a new conflict on SaveEdit.
+  No automatic merge is assumed.
+end note
+note bottom of Files
+  Persist drafts before launching editor; use owner-only file access.
+  Give concurrent edits distinct draft IDs and working files.
+  Keep drafts across process exits; scope them to server and user.
+  A working file survives until confirmed save or explicit discard.
+end note
+legend bottom
+  Proposed contracts, not final Go signatures.
+  ctx represents context.Context for cancellation and request deadlines.
+  Interfaces are implemented by adapters; application logic is shared by CLI and TUI.
+endlegend
+@enduml

@@ -1,0 +1,81 @@
+@startuml HermesCLI
+title hermes-cli: high-level dependencies
+top to bottom direction
+skinparam classAttributeIconSize 0
+skinparam nodesep 60
+skinparam ranksep 65
+hide empty members
+class "main" as Main <<bootstrap>> {
+  construct application objects and adapters
+  inject selected implementations
+  execute root command
+}
+package "Presentation" {
+  class "internal/cli" as CLI {
+    NewRootCommand
+    auth / user / workspace / doc / inbox commands
+  }
+  class "internal/tui" as TUI {
+    Model and screens
+    polling lifecycle and terminal state
+  }
+}
+class "internal/app" as App {
+  Auth / Users / Workspaces / Documents / Inbox
+  consumer-owned Remote and Store interfaces
+  common operations for CLI and TUI
+}
+class "internal/editor" as Editor {
+  Editor interface
+  SystemEditor implementation
+}
+class "internal/model" as Models {
+  User / Workspace / Document / Notification
+  Session / Draft
+  application errors
+}
+class "internal/client" as Clients {
+  HTTPDocumentClient OR GRPCDocumentClient
+  HTTPNotificationClient OR GRPCNotificationClient
+  implement consumer-owned Remote contracts
+}
+class "Local adapters" as Local {
+  FileConfigStore implements ConfigStore
+  CredentialSessionStore implements SessionStore
+  FileDraftStore implements DraftStore
+}
+class "External services" as Services {
+  hermes-document-service
+  hermes-notification-service
+}
+Main -down-> CLI : create and execute
+CLI -right-> TUI : launch without arguments
+CLI -down-> App : invoke
+TUI -down-> App : invoke
+CLI ..> Editor : foreground editor
+TUI ..> Editor : suspend / resume terminal
+App -down-> Clients : uses injected Remote contracts
+App -down-> Local : uses injected Store contracts
+App -left-> Models : shared types
+Clients -down-> Services : selected network protocol
+Clients -right-> Local : session lookup
+note top of Main
+  Creation happens here; runtime calls do not pass through main.
+  All dependencies are explicit; no global mutable command tree.
+end note
+note bottom of App
+  Auth uses AuthRemote and SessionStore.
+  Users uses UsersRemote.
+  Workspaces uses WorkspacesRemote and ConfigStore.
+  Documents uses DocumentsRemote and DraftStore.
+  Inbox uses InboxRemote.
+end note
+legend bottom
+  Overview boxes group Go entities; they are not additional classes.
+  App depends on interfaces, not on concrete adapter packages.
+  Adapter implementation links: hermes-cli-clients.puml.
+  Fake implementations are injected in application tests.
+  One opaque session token; no refresh token.
+  API transport and TUI library are not selected by this proposal.
+endlegend
+@enduml
