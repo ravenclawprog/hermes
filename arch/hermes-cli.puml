@@ -74,6 +74,8 @@ legend bottom
   Overview boxes group Go entities; they are not additional classes.
   App depends on interfaces, not on concrete adapter packages.
   Adapter implementation links: hermes-cli-clients.puml.
+  Internal contracts: contracts/internal/hermes-cli.puml and hermes-cli.md.
+  External messages: contracts/external/hermes-cli.puml and hermes-cli.md.
   Fake implementations are injected in application tests.
   One opaque session token; no refresh token.
   API transport and TUI library are not selected by this proposal.

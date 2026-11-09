@@ -1,0 +1,159 @@
+@startuml HermesCLIExternalRequests
+title hermes-cli: external request / response messages (proposal)
+top to bottom direction
+skinparam classAttributeIconSize 0
+hide empty members
+
+class "Request envelope" as Request {
+  schema_version: integer
+  request_id: string
+  operation: string
+  payload: operation-specific object
+}
+class "Success response" as Success {
+  schema_version: integer
+  request_id: string
+  operation: string
+  status: success
+  payload: operation-specific object
+}
+class "Error response" as Error {
+  schema_version: integer
+  request_id: string
+  operation: string
+  status: error
+  error.code / error.message
+  error.field_errors?: FieldError[]
+  error.current_version?: Version
+  error.effect?: rejected | committed | unknown
+}
+package "CLI -> document-service: example payloads" {
+  class Authenticate {
+    credentials.method: string
+    credentials.proof: object (OPEN)
+  }
+  class UpdateDocument {
+    document_id: ID
+    title: string
+    content: Markdown
+    expected_version: Version
+  }
+  class RespondToInvitation {
+    invitation_id: ID
+    decision: accept | decline
+  }
+}
+package "document-service -> CLI: example success payloads" {
+  class "Authenticate result" as Session {
+    user_id: ID
+    token: opaque secret
+    expires_at: Timestamp
+  }
+  class "UpdateDocument result" as Write {
+    document: Document
+    changed: boolean
+  }
+  class Document {
+    id: ID
+    workspace_id: ID
+    title: string
+    content: Markdown
+    version: Version
+  }
+  class "Invitation result" as Invitation {
+    invitation.id / workspace_id
+    invitation.inviter_id / invitee_id
+    invitation.role / status / expires_at
+  }
+}
+Request ..> Authenticate : payload example
+Request ..> UpdateDocument : payload example
+Request ..> RespondToInvitation : payload example
+Success ..> Session : payload example
+Success ..> Write : payload example
+Success ..> Invitation : payload example
+Write *-- Document
+Request --> Success : same request_id and operation
+Request --> Error : alternative response
+note bottom of Request
+  Protected requests carry a session token in secure headers/metadata.
+  Actor identity comes from the session, not a client actor_id.
+  Logical envelopes do not select HTTP/gRPC encoding or endpoints.
+end note
+legend bottom
+  Complete operation catalogue and field definitions: hermes-cli.md.
+  Request ID correlates messages; it is not an idempotency key.
+  Timeout without response is a local adapter error, not a received Error frame.
+  Drafts, editor paths, context.Context and Go errors stay inside the CLI.
+endlegend
+@enduml
+
+@startuml HermesCLIExternalPush
+title notification-service -> hermes-cli: public push messages (proposal)
+top to bottom direction
+skinparam classAttributeIconSize 0
+hide empty members
+
+class "Public message envelope" as Message {
+  schema_version: integer
+  message_id: ID
+  kind: refresh | notice
+  type: string
+  occurred_at: Timestamp
+  delivery: live | backlog
+  source_event_id?: ID
+  workspace_id?: ID
+  target?: TargetRef
+  payload: type-specific object
+}
+class TargetRef {
+  type: user | workspace | document | invitation
+  id: ID
+}
+package "Refresh payload examples" {
+  class DocumentChanged {
+    document_id: ID
+    version: Version
+  }
+  class WorkspaceChanged {
+    workspace_id: ID
+    version?: Version
+  }
+}
+package "Personal notice payload examples" {
+  class WorkspaceInvitationReceived {
+    invitation_id: ID
+    workspace_id: ID
+    role: admin | editor | viewer
+  }
+  class ProfileChanged {
+    changed_fields: username | email []
+  }
+  class DocumentDeleted {
+    document_id: ID
+    workspace_id: ID
+  }
+}
+Message o-- TargetRef
+Message ..> DocumentChanged : type selects payload
+Message ..> WorkspaceChanged : type selects payload
+Message ..> WorkspaceInvitationReceived : type selects payload
+Message ..> ProfileChanged : type selects payload
+Message ..> DocumentDeleted : type selects payload
+note bottom of Message
+  HNS validates the same opaque token during WebSocket handshake.
+  Live fan-out reaches all active recipient connections.
+  Backlog goes to one connecting session; coordination/ack/replay OPEN.
+  This is a public message, not the internal Kafka event envelope.
+end note
+note bottom of DocumentDeleted
+  Minimal fact only; no openable target and no document contents.
+  Other objects are opened through document-service with current access checks.
+end note
+legend bottom
+  Full proposed type catalogue and OPEN controls: hermes-cli.md.
+  Stable message IDs, ordering, duplicate suppression and delivery guarantees OPEN.
+  No session tokens, credentials, private email values or document bodies.
+  Redis settings Pub/Sub is internal to services, not a CLI push frame.
+endlegend
+@enduml

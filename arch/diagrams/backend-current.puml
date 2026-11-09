@@ -1,0 +1,44 @@
+@startuml BackendCurrent
+title Hermes backend: accepted direction and explicit proposals
+left to right direction
+skinparam componentStyle rectangle
+actor "CLI / TUI" as Client
+component "document-service\nUsers / authentication\nWorkspaces / documents" as HDS
+component "notification-service\nWebSocket connections\nRouting / delivery" as HNS
+database "Document PostgreSQL\nProfiles / credentials\nWorkspaces / memberships / documents" as DB
+database "Redis\nActive sessions" as Redis
+queue "Kafka\nDomain events" as Kafka
+database "Notification PostgreSQL\nDurable inbox: policy OPEN" as Inbox
+
+Client --> HDS : Public API\nregister / login / domain operations
+Client <--> HNS : WebSocket\nconnection + live messages
+HDS --> DB : Own domain data
+HDS --> Redis : Create / revoke sessions
+HNS --> Redis : Validate session on connect
+HDS --> Kafka : Domain facts\npublication reliability OPEN
+Kafka --> HNS : Consume and fan out
+HNS ..> Inbox : Durable notification policy OPEN
+
+note bottom of Redis
+  ACCEPTED: shared active session store (ADR-001).
+  Roles belong to workspace memberships, not sessions.
+  Revocation for already-open sockets remains OPEN.
+end note
+note bottom of HDS
+  PROPOSED (ADR-003): own notification settings;
+  PostgreSQL durable state -> versioned Redis representation
+  -> explicit Pub/Sub UserSettingsChanged(user_id, version).
+  Every HNS instance reloads settings for its local connections.
+  Reconnect/resync repairs missed Pub/Sub signals.
+end note
+note bottom of HNS
+  OPEN: source and freshness of authorization/routing data.
+  No accepted direct access to document PostgreSQL.
+  No requirement to persist each live message before delivery.
+end note
+legend bottom
+  Solid links: accepted direction; dotted link: open policy.
+  A channel does not define delivery guarantees by itself.
+  This view supersedes conflicting transport/ownership details in earlier sketches.
+endlegend
+@enduml

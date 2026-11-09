@@ -1,0 +1,271 @@
+' HISTORICAL / PARTIALLY SUPERSEDED: see arch/notes.txt for status.
+' Current backend direction: arch/diagrams/backend-current.puml and arch/decisions/.
+@startuml BackendDataOwnership
+title Backend: data ownership and exchange channels
+left to right direction
+skinparam componentStyle rectangle
+skinparam packageStyle rectangle
+skinparam nodesep 55
+
+package "Client Zone" #FFE5DD {
+  actor "Client (CLI / TUI)" as Client
+}
+
+package "Server Zone" #E0F4E0 {
+  component "hermes-document-service\nPublic API + session middleware\nInternal authorization API\nOutbox publisher" as HDS
+  component "hermes-notification-service\nPublic API + session middleware\nEvent consumer + inbox policies" as HNS
+
+  database "Document PostgreSQL\nOWNER: document-service\n\nusers + credentials\nworkspaces + memberships\ninvitations\ndocuments + subscriptions\nemail confirmation requests\noutbox_events" as Domain
+  database "Redis: sessions\nCONTRACT OWNER: document-service\n\nsession:{token_hash}\n  session_id, user_id, expires_at, auth_epoch\nuser-auth:{user_id}\n  enabled, auth_epoch\nuser-sessions:{user_id}\n  session IDs / token hashes" as Sessions
+  queue "Kafka: domain-events.v1\nPRODUCER: document-service\nCONSUMER: notification-service" as Kafka
+  database "Notification PostgreSQL\nOWNER: notification-service\n\nnotifications\nnotification_preferences\nprocessed_events\nquarantined_events" as Inbox
+}
+
+Client --> HDS : Public HTTP or gRPC over TLS\nlogin/logout, profiles, spaces, documents\nsession token on protected calls
+Client --> HNS : Public HTTP or gRPC over TLS\ninbox + count, mark read, preferences\nsame session token; polling in v1
+HDS --> Domain : Exclusive domain reads/writes\nmutation + outbox in one transaction
+HDS --> Sessions : Create / validate / revoke sessions\nmanage user authentication state
+HNS --> Sessions : Read-only session validation\nno HDS call for authentication
+HDS --> Kafka : Publish committed outbox facts\noriginal event_id retained on retries
+Kafka --> HNS : At-least-once event consumption
+HNS --> Inbox : Exclusive reads/writes\nnotification + processing receipt transaction
+HNS --> HDS : Internal authenticated service API\nbatch current eligibility checks\nnot session validation
+
+note bottom of Sessions
+  Redis is the authoritative store for active sessions, not a PostgreSQL cache.
+  Token hashes only; session TTL is bounded by expires_at.
+  HNS validates session + enabled user + matching auth_epoch atomically.
+  No workspace roles, emails or document bodies in session records.
+  User session index supports cleanup; epoch change revokes all sessions.
+  Redis unavailable: protected requests fail as temporarily unavailable.
+  Missing session/auth state: require login; never recreate it from an event.
+  Persistence/HA and failover consistency need an operational decision:
+  restoring stale Redis state must not resurrect revoked sessions.
+end note
+note bottom of Kafka
+  Domain events contain IDs, versions and relevant changed fields.
+  They carry no bearer tokens, credentials, private emails or document bodies.
+  UserCreated/UserDeleted do not directly create user inbox notifications.
+  Kafka delivery is not the authority for active sessions or current access.
+end note
+note bottom of Domain
+  Ownership means one service defines schema and allowed mutations.
+  Stores may share a PostgreSQL instance, but HNS has no direct domain access.
+  Clients access service APIs only, never databases, Redis or Kafka.
+end note
+note bottom of HNS
+  Proposal: current access checks use the HDS internal API in v1.
+  There is no local authorization projection yet.
+  Future WebSocket delivery follows durable notification persistence.
+end note
+@enduml
+
+@startuml BackendLogicalData
+title Backend: logical entities and ownership (selected fields)
+hide circle
+skinparam linetype ortho
+
+package "document-service owns: PostgreSQL" {
+  entity "users" as Users {
+    * id : UUID <<PK>>
+    --
+    username / email / display_name
+    status / version
+  }
+  entity "user_credentials" as Credentials {
+    * user_id : UUID <<FK>>
+    --
+    method / verifier_data / credential_version
+  }
+  entity "workspaces" as Workspaces {
+    * id : UUID <<PK>>
+    --
+    owner_id : UUID <<FK>>
+    kind / name / version / deleted_at
+  }
+  entity "workspace_members" as Members {
+    * workspace_id : UUID <<PK, FK>>
+    * user_id : UUID <<PK, FK>>
+    --
+    role : owner | admin | editor | viewer
+    joined_at
+  }
+  entity "workspace_invitations" as Invitations {
+    * id : UUID <<PK>>
+    --
+    workspace_id / inviter_id / invitee_id
+    role / status / expires_at
+  }
+  entity "documents" as Documents {
+    * id : UUID <<PK>>
+    --
+    workspace_id : UUID <<FK>>
+    title / content / version / deleted_at
+    created_by / updated_by
+  }
+  entity "document_subscriptions" as Subscriptions {
+    * document_id : UUID <<PK, FK>>
+    * user_id : UUID <<PK, FK>>
+  }
+  entity "outbox_events" as Outbox {
+    * event_id : UUID <<PK>>
+    --
+    type / schema_version
+    aggregate_type / aggregate_id / aggregate_version
+    actor_id / workspace_id / occurred_at
+    correlation_id / payload / publication_state
+  }
+  entity "email_change_requests" as EmailRequests {
+    * id : UUID <<PK>>
+    --
+    user_id / proposed_email / confirmation_token_hash
+    expires_at / consumed_at
+  }
+}
+package "document-service owns contract: Redis" {
+  entity "session" as Session {
+    * token_hash : key
+    --
+    session_id / user_id / expires_at / auth_epoch
+  }
+  entity "user authentication state" as AuthState {
+    * user_id : key
+    --
+    enabled / auth_epoch
+  }
+}
+package "notification-service owns: PostgreSQL" {
+  entity "notifications" as Notifications {
+    * id : UUID <<PK>>
+    --
+    recipient_id / source_event_id <<UNIQUE pair>>
+    category / type / actor_id
+    workspace_id / target_type / target_id
+    created_at / read_at
+  }
+  entity "notification_preferences" as Preferences {
+    * user_id : UUID <<PK>>
+    * category : users | workspaces | documents <<PK>>
+    --
+    enabled : boolean
+  }
+  entity "processed_events" as Receipts {
+    * consumer_name <<PK>>
+    * event_id : UUID <<PK>>
+    --
+    processed_at
+  }
+}
+
+Users ||--o{ Credentials
+Users ||--o{ Workspaces : owns
+Users ||--o{ Members
+Workspaces ||--o{ Members
+Workspaces ||--o{ Invitations
+Workspaces ||--o{ Documents
+Documents ||--o{ Subscriptions
+Users ||--o{ Subscriptions
+Users ||--o{ EmailRequests
+Session ..> Users : user_id reference
+AuthState ..> Users : user_id reference
+Notifications ..> Users : recipient_id reference
+Notifications ..> Documents : optional target reference
+Preferences ..> Users : user_id reference
+Notifications ..> Outbox : source_event_id reference
+
+note bottom of Members
+  Authorization is a relationship, not a single user.role attribute.
+  One user may be admin in workspace A and viewer in workspace B.
+  Document permissions derive from current membership + workspace/document state.
+  owner_id and owner membership must remain consistent in one transaction.
+  Subscription selects notification interest; it never grants access.
+end note
+note bottom of Notifications
+  Dashed cross-store references are logical IDs, not SQL foreign keys.
+  Notifications do not own profiles, documents or access permissions.
+  A notification does not grant access to its target.
+  Minimal removal/deletion notices use separate visibility policies.
+end note
+@enduml
+
+@startuml BackendReadChannels
+title Backend: authentication, authorization and event-derived inbox
+autonumber
+actor Client
+participant "document-service" as HDS
+database "Document PostgreSQL" as Domain
+database "Redis sessions" as Redis
+queue Kafka
+participant "notification-service" as HNS
+database "Notification PostgreSQL" as Inbox
+
+== Login ==
+Client -> HDS : Authenticate(credentials)
+HDS -> Domain : Verify active account and credentials
+HDS -> Redis : Create session against current enabled auth epoch
+Redis --> HDS : Persisted
+HDS --> Client : Opaque token + expires_at
+note over HDS, Redis
+  Login and disabling an account must serialize authentication state changes.
+  Creating a session must not re-enable a disabled user.
+end note
+
+== Read a document ==
+Client -> HDS : GetDocument(id, token)
+HDS -> Redis : Validate hash, expiry, enabled state and epoch
+Redis --> HDS : Authenticated user_id or invalid
+HDS -> Domain : Read document with current membership/access predicate
+HDS --> Client : Document or access error
+
+== Read inbox ==
+Client -> HNS : ListInboxWithCount(filters, cursor, token)
+HNS -> Redis : Same session validation; no call to HDS
+Redis --> HNS : Authenticated user_id or invalid
+HNS -> Inbox : Read recipient's candidates
+HNS -> HDS : Internal batch eligibility(user_id, target IDs, notice types)
+HDS -> Domain : Current account, memberships and target state
+HDS --> HNS : Eligibility decisions only
+HNS -> Inbox : Apply visibility to page + count + mark-all boundary
+HNS --> Client : Visible notifications, count, cursor, boundary
+note over HNS, Inbox
+  Logical flow, not a final pagination/query implementation.
+  Filtering must cover the full count and fill pages correctly;
+  filtering one raw page and using an unfiltered count is insufficient.
+  Batch checks avoid one HDS request per notification.
+  Unavailable eligibility checks return unavailable, not an unfiltered inbox.
+end note
+Client -> HDS : Open notification target through its owning service API
+HDS -> Redis : Validate session
+HDS -> Domain : Recheck current access and read object
+HDS --> Client : Object or unavailable
+
+== Domain mutation to durable inbox ==
+Client -> HDS : Update object(expected_version, token)
+HDS -> Redis : Validate session
+HDS -> Domain : Transaction: current authorization + mutation + outbox
+HDS --> Client : Result after commit
+HDS -> Kafka : Outbox publisher: committed event, retries allowed
+Kafka -> HNS : Event with stable event_id
+HNS -> HDS : Batch eligibility if event policy needs current domain state
+HNS -> Inbox : Transaction: preferences + notifications + processed receipt
+HNS -> Kafka : Commit offset after durable processing
+
+== Account deletion across two stores ==
+note over HDS, Redis
+  PostgreSQL and Redis do not share a transaction.
+  Proposal: after identity confirmation, first disable user auth state
+  and advance epoch in Redis; then perform the checked domain deletion
+  and outbox transaction in PostgreSQL. Deletion success requires both.
+  If the domain transaction fails, keep the account safely signed out;
+  a reconciler restores login only after proving the account remains active.
+  Operation IDs/reconciliation and races with in-flight commands need
+  a dedicated deletion protocol; Kafka alone cannot revoke sessions promptly.
+end note
+note over HDS, HNS
+  Sessions are stored in Redis, not PostgreSQL (ADR-001).
+  HNS validates sessions directly, without internal ValidateSession calls.
+  Current authorization API is a proposal, not a settled requirement.
+  Replacing it with a Kafka-fed projection introduces an access-revocation
+  delay and needs an explicit consistency contract before adoption.
+end note
+@enduml

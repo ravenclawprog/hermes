@@ -1,45 +1,122 @@
 @startuml events_dispatch
-title Internal events and inbox creation
+title Domain events: publication, routing and live/offline delivery
 autonumber
-actor "User" as User
-participant "hermes (CLI / TUI)" as Client
-participant "hermes-document-service" as HDS
-database "PostgreSQL" as DB
+participant "CLI document client" as Client
+box "hermes-document-service" #E0F4E0
+participant "API + middleware" as API
+participant "internal/app" as App
+participant "internal/domain" as Domain
+participant "internal/postgres" as Repo
+participant "Auth + Redis SessionStore" as Sessions
+participant "internal/kafka\nDomainEventPublisher" as Publisher
+end box
+database "Document PostgreSQL" as DB
+queue "Kafka" as Kafka
+participant "notification-service\nConsumer / routing" as HNS
+participant "Active WebSocket connections\nAll HNS instances" as Connections
+database "Notification PostgreSQL\nPending offline messages" as Inbox
 
-participant "Outbox worker\n(hermes-document-service)" as Publisher
-queue "Apache Kafka" as Bus
-participant "hermes-notification-service" as Handler
-== Change domain state ==
-User -> Client : Perform a modifying operation
-Client -> HDS : Command(session, expected_version)
-group Single transaction
-  HDS -> DB : Check permissions, constraints and version
-  HDS -> DB : Save domain changes and outbox events
+== Domain mutation ==
+Client -> API : Protected command(session, expected_version)
+ref over API, Sessions : Validate session through Auth + Redis (auth.puml)
+API -> App : Use case(authenticated identity, validated request)
+App -> Repo : WithinTransaction: load current domain state
+Repo -> DB : BEGIN; read/lock current state
+App -> Domain : Check current permissions, invariants and version
+alt Rejected / persistence failure
+  Repo -> DB : ROLLBACK
+  App --> API : Error; no committed change facts
+  API --> Client : Error
+else No actual change
+  Repo -> DB : COMMIT without mutation
+  App --> API : Unchanged result; no change event
+  API --> Client : Result
+else Valid change
+  App -> Repo : Persist domain changes
+  Repo -> DB : UPDATE / INSERT / DELETE
+  opt OPEN: outbox/CDC selected as reliable publication mechanism
+    App -> Repo : Persist event intent atomically with domain changes
+    Repo -> DB : Transactional outbox record / selected CDC source
+  end
+  Repo -> DB : COMMIT
+  DB --> Repo : Confirmed / unknown outcome
+  Repo --> App : Transaction result
+  App --> API : Success only after confirmed domain commit / outcome unknown
+  API --> Client : Result; never claim rollback from a lost response
 end
-HDS --> Client : Success after commit or error without events
-
-== Publish asynchronously ==
-Publisher -> DB : Read unpublished outbox events
-Publisher -> Bus : Publish(event_id, type, schema_version, payload)
-Bus --> Publisher : Acknowledgement
-Publisher -> DB : Mark published after acknowledgement
-note over Publisher, Bus
-  A crash between publication and marking may cause redelivery.
+note over App, DB
+  Only facts from committed changes may be published; no facts for reads/errors/no-op.
+  A timeout during COMMIT can leave an unknown outcome.
+  Event intent above is conditional, not a selected outbox implementation.
 end note
 
-== Convert events into notifications ==
-Bus -> Handler : Internal event
-Handler -> Handler : Select users / workspaces / documents policy
-Handler -> DB : Read recipients, preferences and current permissions
-Handler -> Handler : Exclude deleted users, disabled categories and actor\n(except ProfileChanged); merge reasons per recipient
-loop For each eligible recipient
-  Handler -> DB : Transaction: insert notification\nUNIQUE(recipient_id, source_event_id); duplicate is a no-op
+== Publish committed domain facts ==
+opt Confirmed committed change with domain facts
+alt OPEN option: direct publication after commit
+  App -> Publisher : Publish(committed facts) through owned interface
+  Publisher -> Kafka : DomainEvent(event_id, type, schema_version, IDs, versions, payload)
+  Kafka --> Publisher : Broker ack / timeout / failure
+  Publisher --> App : Publication outcome
+  note over App, Kafka
+    Commit-to-publish crash window can lose an event.
+    Success/error response semantics and retry policy remain OPEN (ADR-002).
+    Kafka failure cannot roll back an already committed PostgreSQL mutation.
+  end note
+else OPEN option: outbox/CDC
+  ref over Repo, Kafka
+    Selected publisher/relay reads committed intent and publishes asynchronously.
+    Claiming, retries, acknowledgement and retention require a separate protocol.
+    Broker acceptance followed by a crash may cause duplicate delivery.
+  end ref
 end
-Handler -> Bus : Acknowledge after all results are persisted
-note over Handler, DB
-  Retry failures without losing or duplicating inbox items.
-  Events without user relevance create no notifications.
-  WorkspaceDeleted, WorkspaceMemberRemoved and DocumentDeleted
-  permit minimal notices under their specific recipient policies.
+note over Publisher, Kafka
+  Kafka channel is accepted; reliability, ordering and replay are OPEN.
+  Preserve event_id across retries; never include tokens, credentials,
+  private emails or document bodies in event payloads.
+end note
+end
+
+== Consume, select policy and recipients ==
+Kafka -> HNS : Domain event
+HNS -> HNS : Validate schema; select live signal / personal-notice policy
+ref over HNS
+  OPEN: resolve current recipients and authorization data.
+  Internal HDS API / projection / Redis rights are alternatives, not accepted contracts.
+  Do not query document PostgreSQL directly or use session as workspace permission.
+end ref
+HNS -> HNS : Apply user settings; exclude ineligible/deleted recipients;\nsuppress actor except ProfileChanged; merge recipient reasons
+note over HNS
+  Unsupported schema, poison records, retries and replay require explicit policy.
+  Event may produce a live refresh, a personal notice, both or neither.
+  Invitations remain discoverable through HDS even if category is disabled.
+end note
+
+== Route to each eligible recipient ==
+loop Each recipient selected by policy
+  HNS -> HNS : Resolve active connections across HNS instances (coordination OPEN)
+  alt Recipient has active connections
+    HNS -> Connections : Fan out to ALL active sessions/connections of recipient
+    Connections -> Client : WebSocket message
+    note over HNS, Client
+      A socket write is not a client receipt or read acknowledgement.
+      Live delivery does not require a durable inbox write first.
+    end note
+  else No active connection
+    HNS -> Inbox : Persist recipient's pending message
+    Inbox --> HNS : Stored / failed / outcome unknown
+    note over HNS, Inbox
+      Offline storage follows arch/notes.txt; message classes and exact policy OPEN.
+      Concurrent connect/disconnect between lookup and send requires a protocol.
+      Failure after partial fan-out, retries and duplicate suppression remain OPEN.
+    end note
+  end
+end
+HNS -> Kafka : Commit offset only under agreed processing/delivery policy (OPEN)
+note over Kafka, Inbox
+  No promise of exactly-once delivery or permanent history.
+  Consumer restart and repeated events must be covered by selected dedup/replay rules.
+  PostgreSQL receipts/unique keys are options, not established live delivery semantics.
+  Exclusion during fan-out must not leak content after access revocation;
+  routing freshness and revocation bounds remain OPEN.
 end note
 @enduml

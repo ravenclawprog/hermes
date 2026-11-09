@@ -1,0 +1,110 @@
+@startuml HermesCLIContracts
+title hermes-cli: internal consumer-owned interfaces (proposal)
+top to bottom direction
+skinparam classAttributeIconSize 0
+skinparam nodesep 45
+skinparam ranksep 55
+hide empty members
+
+package "internal/app: consumers" {
+  class Auth
+  class Users
+  class Workspaces
+  class Documents
+  class "Inbox / Live (pending contracts)" as Notifications
+}
+package "internal/app: owned interfaces" {
+  interface AuthRemote {
+    Authenticate(ctx, Credentials): Session, error
+    Logout(ctx, Session): error
+  }
+  interface UsersRemote {
+    Register(ctx, RegisterInput): Registration, error
+    GetSelf(ctx): Profile, error
+    GetPublicProfile(ctx, userID): PublicProfile, error
+    UpdateSelf(ctx, ProfileChanges): Profile, error
+    RequestEmailChange(ctx, EmailChangeInput): error
+    ConfirmEmail(ctx, token): Profile, error
+    GetDeletionBlockers(ctx): Workspace[], error
+    DeleteSelf(ctx, DeleteAccountInput): error
+  }
+  interface WorkspacesRemote {
+    CreateWorkspace / ListWorkspaces / GetWorkspace
+    UpdateWorkspace / DeleteWorkspace
+    ListMembers / ListInvitations
+    InviteMember / RespondToInvitation / RevokeInvitation
+    ChangeRole / RemoveMember / LeaveWorkspace / TransferOwnership
+  }
+  interface DocumentsRemote {
+    Create(ctx, CreateDocumentInput): Document, error
+    List(ctx, DocumentQuery): Page, error
+    Get(ctx, documentID): Document, error
+    Update(ctx, documentID, UpdateDocumentInput): DocumentWrite, error
+    Delete(ctx, documentID, DeleteInput): error
+    Subscribe / Unsubscribe
+  }
+  interface SessionStore {
+    Load(ctx, SessionKey): Session, error
+    Save(ctx, Session): error
+    DeleteIfCurrent(ctx, SessionKey, token): error
+  }
+  interface ConfigStore {
+    Load(ctx): ClientConfig, error
+    Save(ctx, ClientConfig): error
+  }
+  interface DraftStore {
+    Create(ctx, scope, Document): Draft, error
+    Load(ctx, scope, draftID): Draft, error
+    List(ctx, scope): Draft[], error
+    ReadWorking(ctx, scope, draftID): WorkingCopy, error
+    SetTitle(ctx, scope, draftID, title): error
+    SetBase(ctx, scope, draftID, Document): Draft, error
+    Delete(ctx, scope, draftID): error
+  }
+}
+package "Adapters: selected and injected by main" {
+  class "HTTPDocumentClient OR GRPCDocumentClient" as DocumentAdapter
+  class CredentialSessionStore
+  class FileConfigStore
+  class FileDraftStore
+}
+package "Presentation / editor" {
+  class "CLI / TUI" as UI
+  interface "internal/editor.Editor" as Editor {
+    Edit(ctx, existingWorkingFilePath): error
+  }
+  class SystemEditor
+}
+
+Auth --> AuthRemote
+Auth --> SessionStore
+Users --> UsersRemote
+Workspaces --> WorkspacesRemote
+Workspaces --> ConfigStore
+Documents --> DocumentsRemote
+Documents --> DraftStore
+DocumentAdapter ..|> AuthRemote
+DocumentAdapter ..|> UsersRemote
+DocumentAdapter ..|> WorkspacesRemote
+DocumentAdapter ..|> DocumentsRemote
+DocumentAdapter --> SessionStore : load selected session
+CredentialSessionStore ..|> SessionStore
+FileConfigStore ..|> ConfigStore
+FileDraftStore ..|> DraftStore
+UI --> Editor : terminal ownership stays in presentation
+SystemEditor ..|> Editor
+Notifications ..> DocumentsRemote : open target through owning service
+
+note bottom of Notifications
+  InboxRemote / LiveRemote / SettingsRemote signatures are OPEN.
+  Streaming is separate from optional durable inbox/read-state.
+  See hermes-cli.md before implementing these contracts.
+end note
+legend bottom
+  ctx = context.Context. Shared models/errors are in internal/model.
+  App owns interfaces; adapters implement them and map DTOs/errors.
+  Full Go signatures, types and behavioral rules: hermes-cli.md.
+  No wire protocol or implementation is selected by this proposal.
+  Application tests inject fakes for the same interfaces.
+endlegend
+@enduml

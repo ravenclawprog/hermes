@@ -1,123 +1,168 @@
 @startuml workspaces
-title Workspace scenarios
+title Workspaces: membership, invitations and ownership
 autonumber
 actor "User" as User
-participant "hermes (CLI / TUI)" as Client
-participant "hermes-document-service" as HDS
-database "PostgreSQL" as DB
-
-== Create a shared workspace ==
-User -> Client : Create workspace (name, description)
-Client -> HDS : CreateWorkspace(..., session)
-group Single transaction
-  HDS -> DB : Validate active user
-  HDS -> DB : Create shared workspace and owner membership
-  HDS -> DB : Outbox: WorkspaceCreated, WorkspaceMemberAdded
-end
-HDS --> Client : Workspace and version or validation error
-
-== List and select workspaces ==
-User -> Client : List available workspaces
-Client -> HDS : ListWorkspaces(session, cursor)
-HDS -> DB : Find active workspaces by membership
-HDS --> Client : Results including personal workspace; next cursor
-User -> Client : Select workspace
-Client -> HDS : GetWorkspace(id, session)
-HDS -> DB : Check current membership
-HDS --> Client : Workspace or unavailable
-Client -> Client : Save current workspace_id locally on success
-note over Client, DB
-  Selection changes local context, not membership.
-  Every subsequent operation checks access again.
+participant "CLI / TUI\nPresentation" as Client
+participant "CLI internal/app" as ClientApp
+participant "Document client\nHTTP OR gRPC adapter" as Remote
+box "hermes-document-service" #E0F4E0
+participant "API + session middleware" as API
+participant "internal/app" as App
+participant "internal/domain\nPolicies / invariants" as Domain
+participant "internal/postgres\nUnitOfWork / repositories" as Repo
+end box
+database "Document PostgreSQL" as DB
+note over Remote, App
+  Protected requests follow auth.puml: middleware -> Auth -> Redis SessionStore.
+  Only a valid session reaches the use case; Redis failure returns unavailable.
+  App receives authenticated identity, never a client-supplied actor ID.
+  Domain access checks use current data through repositories.
+end note
+note over App, DB
+  Mutations use one PostgreSQL transaction with current access and version checks.
+  Any failed check rolls back all writes; unchanged state creates no change event.
+  Domain facts from committed changes follow events_dispatch.puml.
+  Outbox/CDC versus direct publication remains OPEN (ADR-002).
 end note
 
-== Update workspace settings ==
-User -> Client : Change name or description
-Client -> HDS : UpdateWorkspace(id, changes, expected_version, session)
-group Single transaction
-  HDS -> DB : Check owner/admin role and version; personal requires owner
-  HDS -> DB : Update settings; outbox WorkspaceUpdated only if changed
-end
-HDS --> Client : Current version or permission/version error
+== Create shared workspace ==
+User -> Client : CreateWorkspace(name, description)
+Client -> ClientApp : Workspaces.Create
+ClientApp -> Remote : CreateWorkspace
+Remote -> API : Protected request
+API -> App : Workspaces.Create(actor, request)
+App -> Repo : WithinTransaction; load active actor
+Repo -> DB : BEGIN; SELECT active user
+App -> Domain : Validate workspace + owner membership
+App -> Repo : Create shared workspace and owner membership
+Repo -> DB : INSERT; COMMIT or ROLLBACK
+App --> API : Workspace/version + committed WorkspaceCreated/MemberAdded facts / error
+API --> Remote : Result
+Remote --> ClientApp : Result
+ClientApp --> Client : Result
 
-== Invite a member ==
-User -> Client : Invite an existing user
-Client -> HDS : InviteMember(workspace_id, invitee_id, role)
-group Single transaction
-  HDS -> DB : Validate shared workspace, inviter permissions and active invitee
-  HDS -> DB : Reject existing membership or duplicate pending invitation
-  HDS -> DB : Create invitation with expiry; outbox WorkspaceInvitationCreated
-end
-HDS --> Client : Invitation or error
-note over HDS, DB
-  Invitee receives an inbox item if the workspaces category is enabled.
-  Owner may invite admin/editor/viewer; admin may invite editor/viewer.
+== List, read and select ==
+ClientApp -> Remote : ListWorkspaces(cursor) / GetWorkspace(id)
+Remote -> API : Protected query
+API -> App : Workspaces.List / Get(actor, query)
+App -> Repo : Query active workspaces by current membership
+Repo -> DB : Access-filtered SELECT; personal workspace included
+Repo --> App : Page / workspace / unavailable
+App --> API : Result; no change events
+API --> Remote : Result
+Remote --> ClientApp : Result
+ClientApp -> ClientApp : ConfigStore saves selected workspace only on success
+note over ClientApp, App
+  Selection is local context and grants no access.
+  Subsequent operations recheck current membership.
 end note
 
-== Accept or decline an invitation ==
-User -> Client : Accept or decline my invitation
-Client -> HDS : RespondToInvitation(id, decision, session)
-group Single transaction
-  HDS -> DB : Check recipient, pending status, expires_at and active workspace
-  alt Accept valid invitation
-    HDS -> DB : Create membership; mark invitation accepted
-    HDS -> DB : Outbox: WorkspaceInvitationAccepted, WorkspaceMemberAdded
-  else Decline valid invitation
-    HDS -> DB : Mark invitation declined; outbox WorkspaceInvitationDeclined
-  end
-end
-HDS --> Client : Result or invalid/expired invitation error
+== Update name or description ==
+ClientApp -> Remote : UpdateWorkspace(id, changes, expected_version)
+Remote -> API : Protected request
+API -> App : Workspaces.Update(actor, request)
+App -> Repo : Transaction: load active workspace, membership and version
+Repo -> DB : BEGIN; read current state
+App -> Domain : Require owner/admin; personal workspace requires owner; check version
+App -> Repo : Persist actual changes with new version, or no-op / rollback
+Repo -> DB : UPDATE and COMMIT / no-op / ROLLBACK
+App --> API : Result; WorkspaceUpdated only for committed changes
+API --> Remote : Result
+Remote --> ClientApp : Result
 
-== Revoke or expire an invitation ==
-User -> Client : Revoke a pending invitation
-Client -> HDS : RevokeInvitation(id, session)
-HDS -> DB : Transaction: check inviter management rights and pending status;\nmark revoked; outbox WorkspaceInvitationRevoked
-HDS --> Client : Result or error
-note over HDS, DB
-  Expiration is performed by the server after expires_at:
-  pending becomes expired with WorkspaceInvitationExpired.
-  Revocation, acceptance and expiration must be serialized.
+== Invite existing user ==
+ClientApp -> Remote : InviteMember(workspace, invitee, role)
+Remote -> API : Protected request
+API -> App : Workspaces.InviteMember(actor, request)
+App -> Repo : Transaction: load workspace, actor role, active invitee and pending invitations
+Repo -> DB : BEGIN; SELECT current state
+App -> Domain : Shared workspace; owner may invite admin/editor/viewer;\nadmin may invite editor/viewer; reject member/duplicate pending invitation
+App -> Repo : Create expiring invitation if valid
+Repo -> DB : INSERT; enforce constraints; COMMIT / ROLLBACK
+App --> API : Invitation + WorkspaceInvitationCreated fact / error
+API --> Remote : Result
+Remote --> ClientApp : Result
+
+== Respond to invitation ==
+User -> Client : Accept / decline invitation
+Client -> ClientApp : Workspaces.RespondToInvitation
+ClientApp -> Remote : RespondToInvitation(id, decision)
+Remote -> API : Protected request
+API -> App : Workspaces.RespondToInvitation(actor, request)
+App -> Repo : Transaction: lock invitation; load active workspace/recipient
+Repo -> DB : BEGIN; SELECT current invitation
+App -> Domain : Require addressed user, pending status and unexpired invitation
+alt Accept valid invitation
+  App -> Repo : Create membership; mark accepted
+else Decline valid invitation
+  App -> Repo : Mark declined
+else Invalid, expired or concurrently changed
+  App -> Repo : Roll back; return error
+end
+Repo -> DB : COMMIT accepted changes / ROLLBACK
+App --> API : Result; Accepted + MemberAdded / Declined facts after commit
+API --> Remote : Result
+Remote --> ClientApp : Result
+
+== Revoke or expire invitation ==
+ClientApp -> Remote : RevokeInvitation(id)
+Remote -> API : Protected request
+API -> App : Workspaces.RevokeInvitation(actor, id)
+App -> Repo : Transaction: check management rights; serialize pending -> revoked
+Repo -> DB : Conditional transition; COMMIT / ROLLBACK
+App --> API : Result; WorkspaceInvitationRevoked only for actual transition
+API --> Remote : Result
+Remote --> ClientApp : Result
+note over App, DB
+  Expiration uses the same application/domain/repository boundary.
+  Expired invitations cannot be accepted even before cleanup runs.
+  Expiry scheduling is OPEN; do not assume a chosen background worker.
+  Acceptance, revocation and expiration serialize on the invitation state.
 end note
 
-== Change roles, remove members or leave ==
-User -> Client : Change role, remove member or leave workspace
-Client -> HDS : ChangeRole / RemoveMember / LeaveWorkspace
-HDS -> DB : Validate permissions; protect owner; reject personal workspace
-HDS -> DB : Transaction: update membership; remove inaccessible subscriptions;\noutbox WorkspaceMemberRoleChanged or WorkspaceMemberRemoved
-HDS --> Client : Result or error
+== Change role, remove member or leave ==
+ClientApp -> Remote : ChangeRole / RemoveMember / LeaveWorkspace
+Remote -> API : Protected request
+API -> App : Workspaces membership use case(actor, request)
+App -> Repo : Transaction: load workspace + affected memberships
+Repo -> DB : BEGIN; read/lock current state
+App -> Domain : Reject personal workspace; protect owner; only owner manages admins;\nadmin cannot change owner/admin membership; check requested role
+App -> Repo : Apply membership change and remove inaccessible subscriptions
+Repo -> DB : COMMIT valid changes / ROLLBACK
+App --> API : Result; MemberRoleChanged / MemberRemoved facts for actual changes
+API --> Remote : Result
+Remote --> ClientApp : Result
 
 == Transfer ownership ==
-User -> Client : Transfer ownership to an active member
-Client -> HDS : TransferOwnership(id, new_owner_id, expected_version)
-HDS -> DB : Transaction: check current owner and version;\nnew member becomes owner, previous owner becomes admin;\nupdate owner_id and version; outbox WorkspaceOwnershipTransferred
-HDS --> Client : Result or conflict
-note over HDS
-  Failed checks roll back the entire operation.
-  Only owner manages admins; admin cannot change owner/admin membership.
-  Personal workspace does not support invitations or ownership transfer.
-end note
+ClientApp -> Remote : TransferOwnership(id, new_owner, expected_version)
+Remote -> API : Protected request
+API -> App : Workspaces.TransferOwnership(actor, request)
+App -> Repo : Transaction: serialize workspace and affected users/memberships
+Repo -> DB : BEGIN; read/lock current state
+App -> Domain : Current owner only; shared workspace; active new member; matching version
+App -> Repo : Update owner_id; new member -> owner; previous owner -> admin; increment version
+Repo -> DB : COMMIT all changes / ROLLBACK
+App --> API : Result; WorkspaceOwnershipTransferred after commit
+API --> Remote : Result
+Remote --> ClientApp : Result
 
-== Delete a shared workspace ==
-User -> Client : Delete workspace
-Client --> User : Explain consequences and request confirmation
-User -> Client : Confirm
-Client -> HDS : DeleteWorkspace(id, expected_version, confirmation, session)
-alt Personal workspace, non-owner or stale version
-  HDS --> Client : Denied or conflict; no changes
-else Valid request
-  group Single transaction; recheck constraints
-    HDS -> DB : Check owner, kind and version
-    HDS -> DB : Capture former member IDs for notifications
-    HDS -> DB : Soft-delete workspace; close documents and memberships
-    HDS -> DB : Revoke invitations; remove subscriptions
-    HDS -> DB : Outbox: WorkspaceDeleted, WorkspaceInvitationRevoked\nwith minimal recipient information
-  end
-  HDS --> Client : Deleted
-  Client -> Client : Clear local selection of deleted workspace
-end
-Client --> User : Show result
-note over HDS, DB
-  Former members may receive only a minimal deletion notice.
-  Documents and previous document notifications are inaccessible.
+== Delete shared workspace ==
+User -> Client : Confirm deletion after reviewing consequences
+Client -> ClientApp : Workspaces.Delete(id, expected_version, confirmation)
+ClientApp -> Remote : DeleteWorkspace
+Remote -> API : Protected request
+API -> App : Workspaces.Delete(actor, request)
+App -> Repo : Transaction: load/lock workspace and current membership
+Repo -> DB : BEGIN
+App -> Domain : Require owner, shared kind, matching version and confirmation
+App -> Repo : Capture former members; soft-delete workspace; close documents/memberships;\nrevoke invitations and remove subscriptions
+Repo -> DB : COMMIT all changes / ROLLBACK
+App --> API : Result; WorkspaceDeleted + changed invitation facts after commit
+API --> Remote : Result
+Remote --> ClientApp : Result
+ClientApp -> ClientApp : Clear local selection on confirmed deletion only
+note over App, DB
+  Removal/deletion can produce a minimal notice for former members.
+  It grants no access to documents; routing/eligibility is OPEN (events_dispatch.puml).
 end note
 @enduml

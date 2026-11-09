@@ -1,33 +1,44 @@
 @startuml HermesBaseArch
-package "Client Zone" #ff7755{
-    rectangle "hermes-cli" as CLI {
-    
-    }
-    rectangle "System Editor (Vim/ Nano)" as SE{
-    
-    }
+title Hermes: high-level architecture
+left to right direction
+skinparam componentStyle rectangle
+skinparam packageStyle rectangle
+skinparam nodesep 50
+skinparam ranksep 60
+
+package "Client Zone" #FFE5DD {
+  component "hermes-cli\nCLI / TUI" as CLI
+  component "System editor\nVim / Nano" as Editor
 }
 
+package "Server Zone" #E0F4E0 {
+  component "hermes-document-service\nUsers / authentication\nWorkspaces / documents" as HDS
+  component "hermes-notification-service\nWebSocket connections\nRouting / delivery" as HNS
 
-package "Server Zone" #77e077{
-    rectangle "hermes-document-service" as HDS {
-    
-    }
-    rectangle "hermes-notification-service" as HNS {
-    
-    }
-    database "PostgreSQL" as PSQL 
-    queue "Apache Kafka \n(Topics:\ndoc-events)" as AK
-    database "Redis \n(Publish/Subscriber;\nUser Status)" as RED 
-
+  database "PostgreSQL\nDomain data\nOwner: document-service" as DomainDB
+  database "Redis\nActive sessions" as Redis
+  queue "Apache Kafka\nDomain events" as Kafka
+  database "PostgreSQL\nDurable inbox\nOwner: notification-service" as InboxDB
 }
 
-CLI -down-> SE:run process
-CLI -> HDS:REST/grpc
-CLI -> HNS:Async websocket
+CLI --> Editor : Run editor
+CLI --> HDS : Public API (HTTP / gRPC)\nDomain operations / login / logout
+CLI <--> HNS : WebSocket\nConnect / receive messages
 
-HDS -down-> PSQL:ACID transaction
-HDS -down.> AK:Transactional outbox\n workers
-AK -down-> HNS:Consumer Group
-HNS  <-right-> RED:Routing
+HDS --> DomainDB : Read / write domain data
+HDS --> Redis : Create / validate / revoke sessions
+HNS --> Redis : Validate session
+HDS --> Kafka : Publish domain events
+Kafka --> HNS : Consume events / fan out
+HNS ..> InboxDB : Persist / read inbox\nPolicy under discussion
+
+HDS ..> Redis : Proposed: update user settings\nand publish change signal
+Redis ..> HNS : Proposed: settings lookup\nand Pub/Sub updates
+
+legend bottom
+  Solid links: accepted architectural direction.
+  Dotted links: proposals or policies still under discussion.
+  Redis and Kafka are shared contracts; each service owns its PostgreSQL data.
+  Authorization distribution and delivery guarantees remain open (arch/notes.txt).
+endlegend
 @enduml

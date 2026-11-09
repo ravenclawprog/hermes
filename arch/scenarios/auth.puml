@@ -1,118 +1,152 @@
 @startuml auth
-title Authentication and logout with one session token
+title Authentication: shared Redis sessions and logout
 autonumber
 actor "User" as User
-participant "hermes (CLI / TUI)" as Client
-database "Local credential store" as Local
-participant "hermes-document-service" as HDS
-participant "hermes-notification-service" as HNS
-database "PostgreSQL" as DB
+participant "CLI / TUI" as Client
+participant "CLI internal/app" as ClientApp
+participant "Document client adapter" as Remote
+database "CredentialSessionStore" as Local
+box "hermes-document-service" #E0F4E0
+participant "API + middleware" as API
+participant "internal/app.Auth" as Auth
+participant "Other app use cases" as UseCase
+participant "internal/credentials" as Verifier
+participant "internal/postgres" as Repo
+participant "internal/redis\nSessionStore" as Sessions
+end box
+database "Document PostgreSQL" as DB
+database "Redis sessions" as Redis
+participant "notification-service" as HNS
 
 == Sign in ==
-User -> Client : hermes auth login
-Client --> User : Request credentials using the selected authentication method
-User -> Client : Provide credentials securely
-Client -> HDS : Authenticate(credentials) over TLS
-HDS -> DB : Find active account and verify credentials
-alt Invalid credentials or inactive account
-  HDS --> Client : Authentication failed; no session token
-  Client --> User : Show authentication error
+User -> Client : auth login; provide credentials securely
+Client -> ClientApp : Auth.Login
+ClientApp -> Remote : Authenticate(credentials)
+Remote -> API : TLS request; no session required
+API -> Auth : Authenticate(validated credentials)
+Auth -> Repo : Read active account and credential verifier/version
+Repo -> DB : SELECT account and credentials
+DB --> Repo : Candidate record / not found
+Repo --> Auth : Candidate record
+Auth -> Verifier : Verify(credentials, stored verifier)
+Verifier --> Auth : Valid / invalid
+alt Unknown/inactive user or invalid credentials
+  Auth --> API : Generic authentication failure
 else Valid credentials
-  HDS -> HDS : Generate a cryptographically random opaque token
-  HDS -> DB : Create session (id, user_id, token_hash,\ncreated_at, expires_at, revoked_at=null)
-  DB --> HDS : Session persisted
-  HDS --> Client : Session token and expires_at
-  Client -> Local : Securely store token, expiry and server identity
-  alt Local storage succeeded
-    Local --> Client : Saved
-    Client --> User : Signed in
-  else Local storage failed
-    Local --> Client : Storage error
-    Client -> HDS : Logout(token); attempt to revoke newly created session
-    HDS -> DB : Mark session revoked if request arrives
-    Client --> User : Sign-in not saved; report cleanup outcome
-  end
+  Auth -> Auth : Generate random opaque token; derive token hash
+  ref over Auth, Redis
+    Check account still eligible and create session through SessionStore.
+    Serialize with disable/delete and credential changes (ADR-001).
+    Exact Redis fields / mass revocation / cross-store protocol remain OPEN.
+  end ref
+  Auth -> Sessions : Create(token_hash, user_id, expiry) under agreed eligibility protocol
+  Sessions -> Redis : Write authoritative active session; expiry enforced
+  Redis --> Sessions : Stored / unavailable / unknown outcome
+  Sessions --> Auth : Result
+  Auth --> API : Raw token + expiry only on confirmed creation / unavailable
 end
-note over Client, DB
-  Exactly one token: no access/refresh token pair.
-  The server stores only its hash; the raw token is a bearer credential.
-  Never log the token or credentials; do not pass secrets as CLI arguments.
-  Credential method and session lifetime are to be specified.
+API --> Remote : Response DTO / error
+Remote --> ClientApp : Session / error
+alt Confirmed session received
+  ClientApp -> Local : Store token, expiry and server identity securely
+  alt Local persistence confirmed
+    Local --> ClientApp : Saved
+    ClientApp --> Client : Signed in
+  else Local persistence failed
+    Local --> ClientApp : Error
+    ClientApp -> Remote : Best-effort Logout(new token) through normal logout path
+    Remote --> ClientApp : Revocation confirmed / unknown
+    ClientApp --> Client : Sign-in not saved; report cleanup outcome
+  end
+else No confirmed session
+  ClientApp --> Client : Error; no saved login
+end
+note over ClientApp, Redis
+  One opaque token, no refresh token; server stores only its hash.
+  Never log secrets or pass credentials as CLI arguments.
+  Credential method, TTL and exact session contract remain OPEN.
 end note
 
-== Execute a short command or open TUI ==
-User -> Client : Run a protected command or open hermes
-Client -> Local : Read session for the selected server
+== Protected document-service request ==
+Client -> ClientApp : Execute protected use case
+ClientApp -> Remote : Operation(request)
+Remote -> Local : Read session for selected server
+Local --> Remote : Token / absent
 alt No local token
-  Local --> Client : Not signed in
-  Client --> User : Ask user to run hermes auth login
+  Remote --> ClientApp : Sign-in required; no network operation
 else Token available
-  Local --> Client : Token and expiry
-  Client -> HDS : Protected request with session token over TLS
-  HDS -> DB : Find session by token hash; check expiry,\nrevocation and active user
-  alt Session valid
-    HDS -> DB : Check operation permissions and execute request
-    HDS --> Client : Result or permission denied
-    Client --> User : Display result
-  else Session expired, revoked or unknown
-    HDS --> Client : Unauthenticated
-    Client -> Local : Remove rejected token if it is still the stored token
-    Client --> User : Sign in again; no automatic token refresh
+  Remote -> API : TLS request with token in headers / metadata
+  API -> Auth : ValidateSession(token) from middleware
+  Auth -> Sessions : Validate(hash(token))
+  Sessions -> Redis : Check active session and expiry under shared contract
+  Redis --> Sessions : Identity / invalid / unavailable
+  Sessions --> Auth : Validation result
+  Auth --> API : Authenticated identity / unauthenticated / unavailable
+  alt Valid session
+    API -> UseCase : Invoke(request, authenticated identity)
+    UseCase -> Repo : Read current domain state / transactional mutation
+    Repo -> DB : Current membership and object state
+    Repo --> UseCase : State / persistence result
+    UseCase --> API : Result / denied / conflict
+    API --> Remote : Result / application error
+  else Invalid session
+    API --> Remote : Unauthenticated; do not execute use case
+    Remote --> ClientApp : Unauthenticated
+    ClientApp -> Local : Remove rejected token only if still current
+  else Redis unavailable
+    API --> Remote : Temporarily unavailable; do not execute use case
   end
+  Remote --> ClientApp : Mapped result / error
 end
-note over Client, HDS
-  Ending a command or closing TUI does not revoke the session.
-  Permission denied does not invalidate an authenticated session.
-  A network error does not remove a stored token.
+note over ClientApp, API
+  Permission denied or network failure does not clear the token.
+  Closing CLI/TUI does not revoke the session; there is no automatic refresh.
 end note
 
-== Authenticate requests to notification service ==
-Client -> HNS : Inbox request with the same token over TLS
-HNS -> HDS : ValidateSession(token) over authenticated internal TLS
-HDS -> DB : Check token hash, expiry, revocation and active user
-alt Session valid
-  HDS --> HNS : Authenticated user_id and session expiry
-  HNS -> HNS : Apply recipient and current access checks
-  HNS --> Client : Inbox result or permission denied
-else Session invalid
-  HDS --> HNS : Unauthenticated
-  HNS --> Client : Unauthenticated; sign-in required
-else Validation service unavailable
-  HNS --> Client : Temporarily unavailable; no access granted
+== Connect to notification-service ==
+ClientApp -> HNS : WebSocket handshake with same token over TLS
+HNS -> Redis : Validate hash and expiry using shared session contract
+alt Valid
+  Redis --> HNS : Authenticated user_id and session identity
+  HNS --> ClientApp : Connection established
+else Invalid
+  Redis --> HNS : Invalid session
+  HNS --> ClientApp : Unauthenticated; connection rejected
+else Redis unavailable
+  HNS --> ClientApp : Temporarily unavailable; connection rejected
 end
-note over HDS, HNS
-  Proposed integration: notification service delegates session validation
-  to document service on each request; no positive validation cache initially.
-  Both services use the same session; notification service issues no token.
-  Workspace permissions are checked separately from authentication.
+note over HNS, Redis
+  HNS reads session contract directly; no HNS -> HDS ValidateSession call.
+  Authentication does not establish workspace rights.
+  Revocation/expiry on already-open sockets remains OPEN (ADR-001).
 end note
 
-== Sign out of the current session ==
-User -> Client : hermes auth logout / Sign out in TUI
-Client -> Local : Read current token
-alt No local token
-  Client --> User : Already signed out locally
+== Logout current session ==
+User -> Client : auth logout / Sign out in TUI
+Client -> ClientApp : Auth.Logout
+ClientApp -> Local : Read current token
+Local --> ClientApp : Token / absent
+alt No token
+  ClientApp --> Client : Already signed out locally
 else Token available
-  Local --> Client : Current token
-  Client -> HDS : Logout(token) over TLS
-  alt Server reachable
-    HDS -> DB : Revoke session identified by token hash, if present
-    HDS --> Client : Signed out (also for expired, revoked or unknown token)
-    Client -> Local : Remove this token without deleting a newer login
-    Client --> User : Signed out after local removal succeeds
-  else Server unreachable or outcome unknown
-    Client -> Local : Remove this token without deleting a newer login
-    Client --> User : Signed out locally; server revocation not confirmed
-    note over Client, DB
-      A server session that was not revoked remains valid until expiry.
-      Local deletion alone does not revoke copies of the token.
-    end note
-  end
+  ClientApp -> Remote : Logout(token)
+  Remote -> API : Logout over TLS
+  API -> Auth : Logout(token); allow missing/expired session
+  Auth -> Sessions : Revoke(hash(token))
+  Sessions -> Redis : Remove/invalidate current session if present
+  Redis --> Sessions : Revoked / already absent / unavailable
+  Sessions --> Auth : Result
+  Auth --> API : Signed out only on confirmed revocation/absence / unavailable
+  API --> Remote : Result (or network outcome unknown)
+  Remote --> ClientApp : Confirmed / failed / unknown
+  ClientApp -> Local : Remove matching token, never a newer login
+  ClientApp -> ClientApp : Stop authenticated client activity; close local WebSocket
+  ClientApp --> Client : Signed out / local-only sign-out / local cleanup failure
 end
-note over Client, Local
-  If local deletion fails, report the failure rather than claiming success.
-  Cancel authenticated TUI polling and return to the signed-out screen.
-  Logout affects only this session, not sessions on other devices.
-  Requests already authorized before revocation may finish.
+note over Auth, HNS
+  Redis revocation prevents subsequent successful validation.
+  Other open sockets and requests already authorized require an explicit policy.
+  Failure to confirm revocation means copied tokens may remain usable until expiry.
+  Login/logout produce no domain notification events.
 end note
 @enduml

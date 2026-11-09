@@ -1,109 +1,164 @@
 @startuml documents
-title Document scenarios
+title Documents: reads, edits, recovery and subscriptions
 autonumber
 actor "User" as User
-participant "hermes (CLI / TUI)" as Client
-participant "hermes-document-service" as HDS
-database "PostgreSQL" as DB
-
-== Create a document ==
-User -> Client : Create document (workspace_id, title, Markdown)
-Client -> HDS : CreateDocument(..., session)
-alt Workspace unavailable or role below editor
-  HDS --> Client : Denied; no changes
-else Access allowed
-  group Single transaction
-    HDS -> DB : Check membership and non-empty title
-    HDS -> DB : Create document with version=1 and author attribution
-    HDS -> DB : Outbox: DocumentCreated
-  end
-  HDS --> Client : Document and version
-end
-note over HDS
-  Personal documents belong to the personal workspace.
-  DocumentCreated does not notify all workspace members.
+participant "CLI / TUI\nPresentation" as Client
+participant "CLI internal/app" as ClientApp
+participant "Document client\nHTTP OR gRPC adapter" as Remote
+box "hermes-document-service" #E0F4E0
+participant "API + session middleware" as API
+participant "internal/app" as App
+participant "internal/domain\nPolicies / invariants" as Domain
+participant "internal/postgres\nUnitOfWork / repositories" as Repo
+end box
+database "Document PostgreSQL" as DB
+note over Remote, App
+  Protected requests follow auth.puml: middleware -> Auth -> Redis SessionStore.
+  Only a valid session reaches the use case; Redis failure returns unavailable.
+  App receives authenticated identity, never a client-supplied actor ID.
+  Domain access checks use current data through repositories.
+end note
+note over App, DB
+  Mutations use one PostgreSQL transaction with current access and version checks.
+  Any failed check rolls back all writes; unchanged state creates no change event.
+  Domain facts from committed changes follow events_dispatch.puml.
+  Outbox/CDC versus direct publication remains OPEN (ADR-002).
 end note
 
-== List and search documents ==
-User -> Client : List or search available documents
-Client -> HDS : ListDocuments / SearchDocuments(workspace_id?, query, cursor)
-HDS -> DB : Select active documents in accessible workspaces only
-HDS --> Client : IDs, titles and next cursor
-Client --> User : Show results
-
-== Read and edit a document ==
-User -> Client : Read or edit document
-Client -> HDS : GetDocument(id, session)
-HDS -> DB : Validate membership and active document
-HDS --> Client : title, content, version or unavailable
-opt Edit an accessible document
-  Client -> Client : Keep original version; open external editor
-  User -> Client : Finish editing
-  Client -> Client : Read changes and keep local recovery copy
-  Client -> HDS : UpdateDocument(id, title, content, expected_version)
-  group Single transaction
-    HDS -> DB : Check edit permission, document status and expected_version
-    alt Permission lost or document unavailable
-      HDS --> Client : Access error; no changes
-    else Version mismatch
-      HDS --> Client : Conflict; no changes
-    else Matching version and changed content
-      HDS -> DB : Update document and increment version
-      HDS -> DB : Outbox: DocumentUpdated
-      HDS --> Client : Saved; new version after commit
-    else Matching version and unchanged content
-      HDS --> Client : Current version; no update event
-    end
-  end
-  alt Save succeeded
-    Client --> User : Show saved or unchanged result
-  else Conflict, access error or network failure
-    Client --> User : Show error and path to local recovery copy
-    opt User chooses conflict resolution
-      Client -> HDS : GetDocument(id, session)
-      HDS --> Client : Latest version if still accessible
-      Client --> User : Offer manual comparison and another edit
-    end
-  end
-end
-note over Client
-  TUI refreshes the inbox after the editor exits.
-  An unknown network outcome is checked by reading the document.
-  Never overwrite a newer version without checking it.
+== Create document ==
+User -> Client : Create document(workspace, title, Markdown)
+Client -> ClientApp : Documents.Create
+ClientApp -> Remote : CreateDocument
+Remote -> API : Protected request
+API -> App : Documents.Create(actor, request)
+App -> Repo : Transaction: load workspace and actor membership
+Repo -> DB : BEGIN; read current state
+App -> Domain : Require active workspace, editor/admin/owner and non-empty title
+App -> Repo : Create document(version=1, author=actor)
+Repo -> DB : INSERT; COMMIT / ROLLBACK
+App --> API : Document/version + DocumentCreated fact after commit / error
+API --> Remote : Result
+Remote --> ClientApp : Result
+ClientApp --> Client : Result
+note over App
+  Personal documents belong to personal workspace.
+  Live workspace update and personal notification are distinct policies.
+  DocumentCreated recipients are OPEN; no blanket personal inbox fan-out.
 end note
 
-== Subscribe or unsubscribe ==
-User -> Client : Subscribe to document changes or unsubscribe
-Client -> HDS : SubscribeDocument / UnsubscribeDocument
-HDS -> DB : Transaction: check access; update subscription;\noutbox DocumentSubscriptionCreated/Deleted only if changed
-HDS --> Client : Current subscription state
-note over HDS, DB
-  Subscription grants no access and is removed when access is lost.
-  Repeating the same state does not create another event.
+== List, search and read ==
+ClientApp -> Remote : ListDocuments / SearchDocuments / GetDocument
+Remote -> API : Protected query
+API -> App : Documents query(actor, filters, cursor / id)
+App -> Repo : Access-filtered read of active documents in active workspaces
+Repo -> DB : SELECT with current membership and pagination predicate
+DB --> Repo : Page / document / unavailable
+Repo --> App : Result
+App --> API : DTO data; reads create no events
+API --> Remote : Result
+Remote --> ClientApp : Application models / errors
+ClientApp --> Client : Show results / plain Markdown for CLI read
+
+== Begin edit and launch editor ==
+User -> Client : Edit document
+Client -> ClientApp : Documents.BeginEdit(document_id)
+ClientApp -> Remote : GetDocument(id)
+Remote -> API : Protected read
+API -> App : Documents.Get(actor, id)
+App -> Repo : Read document with current access predicate
+Repo -> DB : SELECT
+Repo --> App : Accessible document + version / error
+App --> API : Result
+API --> Remote : Result
+Remote --> ClientApp : Document / error
+alt Accessible document and local draft persisted
+  ClientApp -> ClientApp : DraftStore.Create(base snapshot, version, working file, server/user)
+  ClientApp --> Client : Draft with persistent working path
+  Client -> Client : Suspend TUI; SystemEditor.Edit(path); resume terminal
+  User -> Client : Finish or cancel editor
+else Read or local storage failed
+  ClientApp --> Client : Error; do not launch editor
+end
+note over Client, ClientApp
+  Editor changes the existing local draft only; it does not upload or delete it.
+  Cancellation/editor failure preserves the draft. Live transport is independent
+  of terminal rendering; reconnect/gap recovery follows notifications_inbox.puml.
 end note
 
-== Delete a document ==
-User -> Client : Delete document
-Client -> HDS : GetDocument(id, session)
-HDS --> Client : Document and version after access check
-Client --> User : Request deletion confirmation
-User -> Client : Confirm
-Client -> HDS : DeleteDocument(id, expected_version, confirmation)
-group Single transaction
-  HDS -> DB : Check editor/admin/owner, active status and version
-  alt Checks passed
-    HDS -> DB : Capture subscriber IDs; soft-delete document
-    HDS -> DB : Remove subscriptions
-    HDS -> DB : Outbox: DocumentDeleted with subscriber IDs
-  else Access denied, deleted document or stale version
-    HDS -> DB : No changes
+== Save edited document ==
+Client -> ClientApp : Documents.SaveEdit(draft_id)
+ClientApp -> ClientApp : Load draft; check server/account; read working file
+ClientApp -> Remote : UpdateDocument(id, title, content, BaseVersion)
+Remote -> API : Protected mutation
+API -> App : Documents.Update(actor, request)
+App -> Repo : Transaction: load active document/workspace, membership and version
+Repo -> DB : BEGIN; read/lock current state
+App -> Domain : Check edit role, expected_version and content changes
+alt Permission lost / unavailable / version mismatch
+  App -> Repo : Roll back
+  Repo -> DB : ROLLBACK
+  App --> API : Access error / conflict
+else Matching version and unchanged content
+  Repo -> DB : COMMIT without writes
+  App --> API : Current document; no event
+else Valid changed content
+  App -> Repo : Persist title/content; increment version and attribution
+  Repo -> DB : UPDATE; COMMIT / ROLLBACK on persistence failure
+  App --> API : Saved document + DocumentUpdated fact after commit / error
+end
+API --> Remote : Result
+Remote --> ClientApp : saved / unchanged / conflict / failed / unknown
+alt Confirmed saved or unchanged
+  ClientApp -> ClientApp : DraftStore.Delete; report cleanup failure separately
+  ClientApp --> Client : Save result
+else Conflict, lost access, network failure or unknown outcome
+  ClientApp --> Client : Keep draft; show recovery path and outcome
+  opt User requests comparison and still has read access
+    Client -> ClientApp : Documents.CompareLatest(draft_id)
+    ClientApp -> Remote : GetDocument via same protected read path
+    Remote --> ClientApp : Latest accessible snapshot / error
+    ClientApp --> Client : Base + local + latest for manual review
+    User -> Client : Review / merge and explicitly choose reviewed base
+    Client -> ClientApp : Documents.RebaseDraft(draft_id, reviewedVersion)
+    ClientApp -> ClientApp : Update base snapshot/version; preserve working content
   end
 end
-HDS --> Client : Deleted, unavailable or conflict
-Client --> User : Show result
-note over HDS
-  DocumentDeleted sends subscribers with current membership a minimal notice.
-  The deleted document cannot be opened.
-  Other notifications targeting the inaccessible document are hidden.
+note over ClientApp
+  No automatic overwrite, merge or blind mutation retry.
+  Unknown save outcome requires inspecting current document; a read alone
+  does not prove which operation produced identical content.
+  Another writer may cause a new conflict on the next SaveEdit.
+end note
+
+== Subscribe / unsubscribe ==
+ClientApp -> Remote : SubscribeDocument / UnsubscribeDocument
+Remote -> API : Protected request
+API -> App : Documents subscription use case(actor, id)
+App -> Repo : Transaction: read active target and membership
+Repo -> DB : BEGIN; SELECT current state
+App -> Domain : Require read access; subscription grants no permission
+App -> Repo : Change subscription only when state differs
+Repo -> DB : INSERT / DELETE; COMMIT / ROLLBACK
+App --> API : Current state; SubscriptionCreated/Deleted only on committed change
+API --> Remote : Result
+Remote --> ClientApp : Result
+
+== Delete document ==
+User -> Client : Confirm deletion of a previously read version
+Client -> ClientApp : Documents.Delete(id, expected_version, confirmation)
+ClientApp -> Remote : DeleteDocument
+Remote -> API : Protected request
+API -> App : Documents.Delete(actor, request)
+App -> Repo : Transaction: read/lock target and current membership
+Repo -> DB : BEGIN
+App -> Domain : Require editor/admin/owner, active target, version and confirmation
+App -> Repo : Capture subscriber IDs; soft-delete document; remove subscriptions
+Repo -> DB : COMMIT valid changes / ROLLBACK
+App --> API : Result; DocumentDeleted fact after commit
+API --> Remote : Result
+Remote --> ClientApp : Result
+note over App, DB
+  A minimal deletion notice may be routed to eligible subscribers.
+  Opening a deleted target returns unavailable; old notices grant no access.
 end note
 @enduml

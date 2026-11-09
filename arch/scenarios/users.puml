@@ -1,92 +1,154 @@
 @startuml users
-title User scenarios
+title Users: application use cases and domain persistence
 autonumber
 actor "User" as User
-participant "hermes (CLI / TUI)" as Client
-participant "hermes-document-service" as HDS
-database "PostgreSQL" as DB
+participant "CLI / TUI\nPresentation" as Client
+participant "CLI internal/app" as ClientApp
+participant "Document client\nHTTP OR gRPC adapter" as Remote
+box "hermes-document-service" #E0F4E0
+participant "API + session middleware" as API
+participant "internal/app" as App
+participant "internal/domain\nPolicies / invariants" as Domain
+participant "internal/postgres\nUnitOfWork / repositories" as Repo
+end box
+database "Document PostgreSQL" as DB
+note over Remote, App
+  Protected requests follow auth.puml: middleware -> Auth -> Redis SessionStore.
+  Only a valid session reaches the use case; Redis failure returns unavailable.
+  App receives authenticated identity, never a client-supplied actor ID.
+  Domain access checks use current data through repositories.
+end note
+note over App, DB
+  Mutations use one PostgreSQL transaction with current access and version checks.
+  Any failed check rolls back all writes; unchanged state creates no change event.
+  Domain facts from committed changes follow events_dispatch.puml.
+  Outbox/CDC versus direct publication remains OPEN (ADR-002).
+end note
 
-== Create an account ==
-User -> Client : Register (username, display_name, email, credentials)
-Client -> HDS : Register(...)
-HDS -> DB : Validate input and username/email uniqueness
-alt Invalid input or duplicate identity
-  HDS --> Client : Validation error; no entities created
-else Valid input
-  group Single transaction
-    HDS -> DB : Create active user, personal workspace and owner membership
-    HDS -> DB : Outbox: UserCreated, WorkspaceCreated, WorkspaceMemberAdded
-  end
-  HDS --> Client : Profile and personal workspace
+== Register ==
+User -> Client : Register(username, display_name, email, credentials)
+Client -> ClientApp : Users.Register
+ClientApp -> Remote : Register(request)
+Remote -> API : Public request over TLS; no session required
+API -> App : Users.Register(validated DTO)
+App -> App : CredentialVerifier prepares verifier data\nvia internal/credentials (method OPEN)
+App -> Repo : WithinTransaction
+Repo -> DB : BEGIN
+App -> Domain : Validate identity and personal workspace invariants
+App -> Repo : Create user + credentials + personal workspace + owner membership
+Repo -> DB : INSERT; enforce normalized identity uniqueness
+alt Invalid input, uniqueness conflict or persistence failure
+  Repo -> DB : ROLLBACK
+  App --> API : Validation / conflict / unavailable
+else All writes valid
+  Repo -> DB : COMMIT
+  App --> API : Profile + personal workspace; facts ready for publication
 end
-note over HDS, DB
-  Sign-in and logout are described in auth.puml.
-  Credential method and initial email verification are to be specified.
-  Credentials are excluded from profiles and events.
+API --> Remote : Map result to transport DTO / error
+Remote --> ClientApp : Application result
+ClientApp --> Client : Profile or error
+Client --> User : Show result; login is a separate operation
+note over App, DB
+  UserCreated, WorkspaceCreated, WorkspaceMemberAdded describe committed changes.
+  These facts do not create personal notifications by themselves.
+  Lost registration response: outcome unknown; retry/recovery contract is OPEN.
 end note
 
-== Read a profile ==
-User -> Client : Open my profile
-Client -> HDS : GetSelf(session)
-HDS -> DB : Validate active session; read profile
-HDS --> Client : Private profile and version
-note over HDS
-  GetPublicProfile exposes only public fields
-  to users sharing a workspace.
-end note
+== Read private or public profile ==
+User -> Client : Open own / another user's profile
+Client -> ClientApp : Users.GetSelf / GetPublicProfile
+ClientApp -> Remote : Profile query
+Remote -> API : Protected request
+API -> App : Users.GetSelf(actor) / GetPublicProfile(actor, target)
+App -> Repo : Read active profile with required visibility predicate
+Repo -> DB : SELECT; public profile requires shared active workspace membership
+DB --> Repo : Allowed fields or unavailable
+Repo --> App : Profile
+App --> API : Own email only in private profile; no credentials
+API --> Remote : DTO / error
+Remote --> ClientApp : Profile / error
+ClientApp --> Client : Result
 
-== Update a profile ==
-User -> Client : Change display_name, username or email
-Client -> HDS : UpdateSelf(changes, expected_version, session)
-HDS -> DB : Validate version, format and uniqueness
-alt Invalid input or stale version
-  HDS --> Client : Error or conflict; no changes
-else Email change requested
-  HDS -> DB : Store pending email verification request
-  HDS --> Client : Verification required; previous email remains active
-  User -> Client : Verify new email
-  Client -> HDS : ConfirmEmail(one_time_confirmation)
-  group Single transaction
-    HDS -> DB : Validate confirmation and uniqueness; update email and version
-    HDS -> DB : Outbox: UserUpdated
-  end
-  HDS --> Client : Updated profile or verification error
-else Username or display_name change
-  group Single transaction
-    HDS -> DB : Update profile using expected_version
-    HDS -> DB : Outbox: UserUpdated only if fields changed
-  end
-  HDS --> Client : Profile and current version
+== Update username / display name ==
+ClientApp -> Remote : UpdateSelf(changes, expected_version)
+Remote -> API : Protected request
+API -> App : Users.UpdateSelf(actor, changes, expected_version)
+App -> Repo : WithinTransaction; load active user and version
+Repo -> DB : BEGIN; read/lock current row
+App -> Domain : Validate fields, expected_version and actual changes
+alt Valid changed values
+  App -> Repo : Update user and increment version
+  Repo -> DB : UPDATE with identity constraints; COMMIT if valid
+  App --> API : Updated profile; UserUpdated fact after commit
+else Unchanged or rejected
+  Repo -> DB : COMMIT without writes / ROLLBACK on error
+  App --> API : Current profile / conflict / validation error
 end
-note over HDS
-  Username/email changes notify the owner with ProfileChanged
-  if the users category is enabled. Display name changes do not notify.
+API --> Remote : Result
+Remote --> ClientApp : Result
+note over App
+  ProfileChanged policy: notify owner for username/email changes, if enabled.
+  Display-name-only changes have no personal notification.
 end note
 
-== Delete an account ==
-User -> Client : Delete my account
-Client -> HDS : GetDeletionBlockers(session)
-HDS -> DB : Find shared workspaces owned by this user
-alt Shared workspaces are still owned
-  HDS --> Client : Blocking workspaces
-  Client --> User : Transfer ownership or delete these workspaces first
-else No ownership blockers
-  Client --> User : Explain personal document loss; request identity confirmation
-  User -> Client : Confirm account deletion
-  Client -> HDS : DeleteSelf(confirmation, expected_version, session)
-  group Single transaction; recheck all conditions
-    HDS -> DB : Prevent concurrent ownership transfer; validate constraints
-    HDS -> DB : Mark user deleted; revoke sessions
-    HDS -> DB : Close personal workspace and documents; remove memberships/subscriptions
-    HDS -> DB : Revoke pending invitations involving this user
-    HDS -> DB : Outbox: UserDeleted, WorkspaceDeleted,\nWorkspaceMemberRemoved, WorkspaceInvitationRevoked
-  end
-  HDS --> Client : Deleted or conflict if conditions changed
-  Client -> Client : Clear local session only after successful deletion
-  Client --> User : Show result
-end
-note over HDS, DB
-  Shared documents retain attribution as "Deleted user".
-  Physical deletion and anonymization policies are to be specified.
+== Change email ==
+ClientApp -> Remote : RequestEmailChange(new_email, expected_version)
+Remote -> API : Protected request
+API -> App : Users.RequestEmailChange(actor, request)
+App -> Repo : Transaction: check active user/version; store expiring token hash
+Repo -> DB : Persist pending request; current email unchanged
+App --> API : Confirmation required
+API --> Remote : Result
+Remote --> ClientApp : Confirmation required
+note over App, DB
+  Confirmation delivery and initial email verification remain OPEN.
+  Confirmation secrets never enter domain events or notification inbox.
 end note
+User -> Client : Confirm new email using one-time token
+Client -> ClientApp : Users.ConfirmEmail
+ClientApp -> Remote : ConfirmEmail(token)
+Remote -> API : Confirmation request over TLS
+API -> App : Users.ConfirmEmail(token)
+App -> Repo : Transaction: check token, expiry, active user and uniqueness;\nchange only email, increment version, consume token
+Repo -> DB : Commit all changes or roll back
+App --> API : Updated profile + UserUpdated fact after commit / error
+API --> Remote : Result
+Remote --> ClientApp : Result
+
+== Delete account ==
+ClientApp -> Remote : GetDeletionBlockers
+Remote -> API : Protected request
+API -> App : Users.GetDeletionBlockers(actor)
+App -> Repo : Find active shared workspaces owned by actor
+Repo -> DB : SELECT ownership blockers
+Repo --> App : Blockers
+App --> API : Blockers; preliminary check only
+API --> Remote : Result
+Remote --> ClientApp : Blockers
+ClientApp --> Client : Require transfer/deletion first, or ask identity confirmation
+User -> Client : Confirm account deletion
+Client -> ClientApp : Users.DeleteSelf(confirmation, expected_version)
+ClientApp -> Remote : DeleteSelf
+Remote -> API : Protected request
+API -> App : Users.DeleteSelf(actor, confirmation, expected_version)
+App -> App : Verify identity through CredentialVerifier
+ref over App, DB
+  OPEN coordination protocol (ADR-001): domain deletion in PostgreSQL
+  and revocation of all user sessions in Redis; no shared transaction
+end ref
+note over App, DB
+  Domain transaction rechecks active user/version and ownership blockers.
+  Serialize against ownership transfer, new memberships and invitations.
+  Mark user deleted; close personal workspace/documents; remove memberships,
+  subscriptions and pending confirmations; revoke affected invitations.
+  Retain shared-document attribution as "Deleted user".
+  Facts: UserDeleted, WorkspaceDeleted, membership/invitation changes.
+  No success until domain deletion AND session revocation are confirmed.
+  Ordering, retries and reconciliation must be agreed before implementation.
+end note
+App --> API : Confirmed deletion / conflict / unavailable / outcome unknown
+API --> Remote : Result
+Remote --> ClientApp : Result
+ClientApp -> ClientApp : Clear local session only on confirmed deletion\nor explicit unauthenticated response
+ClientApp --> Client : Result; keep unknown outcome visible
 @enduml

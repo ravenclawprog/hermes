@@ -1,47 +1,150 @@
 @startuml notifications_inbox
-title Inbox and notification preferences
+title Notifications: WebSocket, offline recovery and settings
 autonumber
 actor "User" as User
-participant "hermes (CLI / TUI)" as Client
-participant "hermes-notification-service" as HNS
-database "PostgreSQL" as DB
+participant "CLI / TUI" as Client
+participant "CLI internal/app" as ClientApp
+participant "Live client\nSeparate streaming contract" as Live
+participant "Document client\nHTTP OR gRPC adapter" as Document
+box "hermes-document-service" #E0F4E0
+participant "API + middleware" as API
+participant "internal/app\nIncluding proposed settings" as App
+participant "internal/postgres" as Repo
+participant "internal/redis/settings\nPROPOSED" as Settings
+end box
+database "Document PostgreSQL" as DB
+database "Redis\nSessions + proposed settings/PubSub" as Redis
+participant "notification-service\nInstance A" as HNS
+participant "notification-service\nInstance B" as OtherHNS
+database "Notification PostgreSQL\nPending offline messages" as Pending
 
-== Update notification preferences ==
-User -> Client : Configure users / workspaces / documents category
-Client -> HNS : UpdateNotificationPreferences(category, enabled, session)
-HNS -> DB : Save preferences for authenticated user only
-HNS --> Client : Updated preferences
-note over HNS
-  Preferences affect future notifications, not events or existing inbox items.
+== Connect / reconnect ==
+User -> Client : Open TUI / explicitly start live reception
+Client -> ClientApp : Start live connection using selected session
+ClientApp -> Live : Connect(token)
+Live -> HNS : WebSocket handshake over TLS
+HNS -> Redis : Validate session using shared contract (ADR-001)
+alt Invalid session or Redis unavailable
+  HNS --> Live : Unauthenticated / temporarily unavailable; no connection
+  Live --> ClientApp : Error
+  ClientApp --> Client : Sign-in required / retryable connection error
+else Valid session
+  Redis --> HNS : Authenticated user_id and session identity
+  HNS -> HNS : Register local connection; coordinate online routing (OPEN)
+  ref over HNS, Redis
+    Load current user settings (ADR-003 proposed Redis representation).
+    Settings absence/unavailability behavior and authorization source remain OPEN.
+  end ref
+  HNS --> Live : Connected
+  Live --> ClientApp : Connection established
+end
+note over ClientApp, HNS
+  Live streaming is a separate client contract from InboxRemote.
+  Long-lived connection ownership and reconnect/backoff need client design;
+  do not reinterpret existing HTTP/GRPC inbox adapters as WebSocket adapters.
+  One-shot CLI operations do not imply a persistent WebSocket.
 end note
 
-== Read inbox from CLI or TUI ==
-User -> Client : Open inbox or run hermes inbox list
-Client -> HNS : ListInbox(category?, unread_only?, cursor), UnreadCount
-HNS -> DB : Select recipient inbox; hide inaccessible targets\nexcept minimal deletion/removal notices
-HNS --> Client : Items, cursor, mark-all boundary and unread count
-Client --> User : Show inbox
+== Recover pending offline messages ==
+ref over HNS, Pending
+  For a valid connection, coordinate pending-message recovery with live routing.
+  One connecting session receives accumulated messages (arch/notes.txt).
+  Exclusive claim/lease, batching and concurrent connection protocol remain OPEN.
+end ref
+HNS -> Pending : Read/claim user's pending messages under agreed protocol
+Pending --> HNS : Batch / empty / unavailable
+HNS -> HNS : Recheck applicable visibility and recipient ownership (source OPEN)
+HNS -> Live : Send pending batch to selected connection
+Live -> ClientApp : Recovered messages
+ClientApp --> Client : Display after terminal is available
+note over HNS, Pending
+  Client ack, removal/marking, retry after disconnect and claim release are OPEN.
+  Do not delete messages merely because a socket write succeeded.
+  Fan-out of this backlog to other sessions and permanent history are not required.
+  Incoming live messages go to all active connections (events_dispatch.puml).
+end note
 
 == Open a notification target ==
-User -> Client : Open notification
-Client -> HNS : GetTarget(notification_id, session)
-HNS -> DB : Validate recipient and current target permissions
-alt Target accessible
-  HNS --> Client : Document, invitation or profile
-  Client -> HNS : MarkRead(notification_id)
-  HNS -> DB : Set read_at if not already set
-else Target deleted or access revoked
-  HNS --> Client : Target unavailable; no content disclosed
-end
+User -> Client : Open target from a message
+Client -> ClientApp : Documents.Get / Workspaces.Get / Users.GetPublicProfile(target_id)
+ClientApp -> Document : Query target through owning service adapter
+Document -> API : Protected domain read
+ref over API, App : Validate session through Auth + Redis (auth.puml)
+API -> App : Query(authenticated actor, target_id)
+App -> Repo : Read active target with CURRENT domain access predicate
+Repo -> DB : Access-filtered SELECT
+Repo --> App : Accessible object / unavailable
+App --> API : Allowed DTO / error
+API --> Document : Result
+Document --> ClientApp : Model / error
+ClientApp --> Client : Show target or unavailable
+note over ClientApp, App
+  HNS delivers a message/target reference, not document contents via GetTarget.
+  A message does not grant access. Minimal deletion/removal notices
+  contain no inaccessible document content and may have no openable target.
+end note
 
-== Mark notifications as read ==
-User -> Client : Mark one item or all listed items as read
-Client -> HNS : MarkRead(id) / MarkAllRead(list_boundary)
-HNS -> DB : Validate recipient; update read_at up to the boundary
-HNS --> Client : Updated unread count
-note over Client, DB
-  New arrivals beyond the boundary remain unread.
-  TUI polls for updates; one-shot CLI exits.
-  Inbox items persist even when no client is running.
+== Optional durable inbox / read state ==
+ref over ClientApp, Pending
+  OPEN: ListInbox, pagination, unread count, MarkRead / MarkAllRead contracts.
+  If retained: recipient ownership + current visibility govern items AND counts;
+  mark-all uses a boundary that excludes later arrivals.
+  Offline recovery does not itself imply permanent history or read receipts.
+end ref
+
+== Proposed settings update (ADR-003) ==
+User -> Client : Enable/disable notification category
+Client -> ClientApp : Settings.Update(category, enabled, expected_version)
+ClientApp -> Document : Update user settings
+Document -> API : Protected request
+ref over API, App : Validate session through Auth + Redis
+API -> App : Proposed Settings.Update(authenticated actor, request)
+App -> Repo : Transaction: read current settings, check version, persist changes
+Repo -> DB : BEGIN; UPDATE settings/version; COMMIT / ROLLBACK
+Repo --> App : Confirmed durable settings / error
+alt PostgreSQL update confirmed
+  App -> Settings : Synchronize versioned user settings via owned interface
+  Settings -> Redis : Update representation only if version is newer;\nexplicit PUBLISH UserSettingsChanged(user_id, version)
+  Redis --> Settings : Synchronized / failed / unknown
+  Settings --> App : Synchronization outcome
+  note over App, Redis
+    Proposal, not a cross-store transaction.
+    Durable-write success followed by Redis failure needs retry/reconciliation.
+    API status for "saved but not propagated", atomic Redis write/PUBLISH
+    and maximum propagation delay remain OPEN.
+  end note
+else PostgreSQL update rejected / failed
+  App -> App : Do not publish an uncommitted settings change
+end
+App --> API : Settings result under agreed partial-failure contract (OPEN)
+API --> Document : Result
+Document --> ClientApp : Result
+
+== Proposed propagation to every HNS instance ==
+Redis -> HNS : Pub/Sub UserSettingsChanged(user_id, version)
+Redis -> OtherHNS : Same signal on every subscribed HNS instance
+HNS -> Redis : Reload current versioned settings
+OtherHNS -> Redis : Reload current versioned settings
+Redis --> HNS : Current settings/version
+Redis --> OtherHNS : Current settings/version
+HNS -> HNS : Apply to ALL local connections of this user
+OtherHNS -> OtherHNS : Apply to ALL local connections of this user
+note over Redis, OtherHNS
+  New connections load current settings; subscription/load race must be closed.
+  Pub/Sub has no replay: on reconnect resync connected users;
+  proposed periodic version checks repair missed signals.
+  Reordered/stale signals must not roll settings back.
+  Settings are not workspace authorization.
+end note
+
+== Disconnect, expiry or revocation ==
+Live -> HNS : Connection closed / transport failure
+HNS -> HNS : Unregister local connection; update routing under agreed protocol
+note over Live, HNS
+  Logout/expiry/account deletion while socket remains open needs policy (ADR-001).
+  No claim of instantaneous remote socket revocation.
+  Reconnect authenticates again; gap recovery/acknowledgements remain OPEN.
+  During external editing, preserve local draft and restore UI independently
+  from live transport; refreshing domain state does not guarantee message replay.
 end note
 @enduml

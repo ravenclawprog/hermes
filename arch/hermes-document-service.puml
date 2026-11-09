@@ -1,0 +1,126 @@
+@startuml HermesDocumentService
+allowmixing
+title hermes-document-service: high-level dependencies (proposal)
+top to bottom direction
+skinparam classAttributeIconSize 0
+skinparam nodesep 60
+skinparam ranksep 65
+hide empty members
+
+class "main" as Main <<bootstrap>> {
+  load configuration
+  construct application objects and adapters
+  inject selected implementations
+  start server; coordinate graceful shutdown
+}
+package "Presentation" {
+  class "internal/api" as API {
+    HTTP OR gRPC handlers
+    decode requests / validate DTOs / map errors
+    Auth / Users / Workspaces / Documents
+  }
+  class "internal/api/session" as Middleware {
+    extract opaque session token
+    validate session; pass authenticated identity
+  }
+}
+class "internal/app" as App {
+  Auth / Users / Workspaces / Documents
+  orchestrate use cases and domain transactions
+  consumer-owned repository and adapter interfaces
+}
+class "internal/domain" as Domain {
+  User / Credentials / Workspace / Membership
+  Invitation / Document / Subscription
+  access policies / invariants / version conflicts
+  domain events and application errors
+}
+package "Infrastructure adapters" {
+  class "internal/postgres" as Postgres {
+    UnitOfWork and transactional repositories
+    users / credentials / workspaces / memberships
+    invitations / documents / subscriptions
+  }
+  class "internal/redis" as Redis {
+    SessionStore implementation
+    create / validate / revoke active sessions
+    versioned shared contract for HDS and HNS
+  }
+  class "internal/credentials" as Credentials {
+    CredentialVerifier implementation
+    prepare / verify credential data
+    authentication method remains open
+  }
+  class "internal/kafka" as Kafka {
+    DomainEventPublisher implementation
+    serialize and publish domain facts
+    publication protocol remains open (ADR-002)
+  }
+}
+package "External infrastructure" {
+  database "PostgreSQL\nDomain data" as DB
+  database "Redis\nActive sessions" as Sessions
+  queue "Kafka\nDomain events to notification-service" as Events
+}
+package "Proposed extensions" {
+  class "internal/app/settings" as Settings {
+    user settings use cases (ADR-003)
+    PostgreSQL persistence + versioned Redis state
+    synchronize changes through an owned interface
+  }
+  class "internal/redis/settings" as SettingsAdapter {
+    settings representation + explicit Pub/Sub signal
+    UserSettingsChanged(user_id, version)
+    retry / reconciliation protocol remains open
+  }
+}
+
+Main -down-> API : create and serve
+Main -down-> App : construct and inject adapters
+API -right-> Middleware : protected operations
+Middleware -down-> App : Auth.ValidateSession
+API -down-> App : invoke use cases
+App -left-> Domain : apply policies and invariants
+App -down-> Postgres : uses UnitOfWork / repository contracts
+App -down-> Redis : uses SessionStore contract
+App -right-> Credentials : uses CredentialVerifier contract
+App -down-> Kafka : uses DomainEventPublisher contract
+Postgres ..> Domain : map stored entities
+Postgres -down-> DB : read / write; commit / rollback
+Redis -down-> Sessions : session lifecycle
+Kafka -down-> Events : publish
+API ..> Settings : proposed settings operations
+Settings ..> Postgres : proposed durable settings repository
+Settings ..> SettingsAdapter : proposed synchronization contract
+SettingsAdapter ..> Sessions : proposed versioned state + Pub/Sub
+
+note top of Main
+  Creation happens here; runtime requests do not pass through main.
+  Bootstrap owns infrastructure connections and shutdown order.
+end note
+note bottom of App
+  Authentication establishes identity; domain operations check current access.
+  Registration creates user + personal workspace + owner membership
+  in one PostgreSQL transaction. Domain mutations check expected_version.
+  PostgreSQL and Redis do not share a transaction: account deletion and
+  session revocation require a separate coordination protocol (ADR-001).
+end note
+note bottom of Kafka
+  Kafka is the accepted event channel, not a delivery guarantee.
+  Direct post-commit publication versus outbox/CDC remains open.
+  An outbox worker and atomic event persistence must be detailed
+  if that option is selected; they are not assumed by this diagram.
+end note
+legend bottom
+  Proposed Go package structure; server code is not implemented yet.
+  Boxes group responsibilities; they are not additional Go classes.
+  App owns interfaces; infrastructure adapters implement them.
+  Adapter arrows show injected runtime dependencies, not concrete Go imports.
+  Fake adapters can be injected in application tests.
+  Solid links: base dependency structure; dotted links to settings: proposal.
+  Sessions live in Redis, not PostgreSQL (ADR-001).
+  API transport and credential method are not selected.
+  HNS authorization access is open; no internal authorization API is assumed.
+  User scenarios: scenarios/users.puml; authentication: scenarios/auth.puml.
+endlegend
+@enduml
