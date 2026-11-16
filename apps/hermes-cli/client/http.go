@@ -1,0 +1,116 @@
+package client
+
+import (
+	"bytes"
+	"context"
+	"crypto/rand"
+	"encoding/hex"
+	"encoding/json"
+	"fmt"
+	"net/http"
+	"time"
+)
+
+type HTTPClient struct {
+	baseURL    string
+	httpClient *http.Client
+}
+
+func NewHTTPClient(baseURL string) *HTTPClient {
+	return &HTTPClient{
+		baseURL: baseURL,
+		httpClient: &http.Client{
+			Timeout: 10 * time.Second,
+		},
+	}
+}
+
+func (c *HTTPClient) Authenticate(
+	ctx context.Context,
+	username string,
+	password []byte,
+) (Session, error) {
+	requestIDBytes := make([]byte, 16)
+	if _, err := rand.Read(requestIDBytes); err != nil {
+		return Session{}, fmt.Errorf("generate request ID: %w", err)
+	}
+	request := authenticateRequest{
+		SchemaVersion: 1,
+		RequestID:     hex.EncodeToString(requestIDBytes),
+		Operation:     "Authenticate",
+		Payload: authenticatePayload{
+			Username: username,
+			Password: string(password),
+		},
+	}
+
+	body, err := json.Marshal(request)
+	if err != nil {
+		return Session{}, fmt.Errorf("encode authentication request: %w", err)
+	}
+
+	httpRequest, err := http.NewRequestWithContext(
+		ctx,
+		http.MethodPost,
+		c.baseURL+"/auth/login",
+		bytes.NewReader(body),
+	)
+	if err != nil {
+		return Session{}, fmt.Errorf("create authentication request: %w", err)
+	}
+
+	httpRequest.Header.Set("Content-Type", "application/json")
+
+	response, err := c.httpClient.Do(httpRequest)
+	if err != nil {
+		return Session{}, fmt.Errorf("send authentication request: %w", err)
+	}
+	defer response.Body.Close()
+
+	var result authenticateResponse
+
+	if err := json.NewDecoder(response.Body).Decode(&result); err != nil {
+		return Session{}, fmt.Errorf("decode authentication response: %w", err)
+	}
+
+	if result.SchemaVersion != 1 ||
+		result.RequestID != request.RequestID ||
+		result.Operation != request.Operation {
+		return Session{}, fmt.Errorf("invalid authentication response envelope")
+	}
+
+	switch result.Status {
+	case "error":
+		if result.Error == nil || result.Payload != nil || result.Error.Code == "" {
+			return Session{}, fmt.Errorf("invalid authentication error response")
+		}
+		return Session{}, &APIError{
+			Code: result.Error.Code,
+		}
+
+	case "success":
+		if response.StatusCode != http.StatusOK {
+			return Session{}, fmt.Errorf(
+				"unexpected authentication HTTP status: %d",
+				response.StatusCode,
+			)
+		}
+		if result.Payload == nil || result.Error != nil {
+			return Session{}, fmt.Errorf("invalid authentication success response")
+		}
+
+		payload := result.Payload
+		if payload.UserID == "" || payload.Token == "" || payload.ExpiresAt.IsZero() {
+			return Session{}, fmt.Errorf("incomplete authentication session")
+		}
+
+		return Session{
+			UserID:    payload.UserID,
+			Token:     payload.Token,
+			ExpiresAt: payload.ExpiresAt,
+		}, nil
+
+	default:
+		return Session{}, fmt.Errorf("unknown authentication response status")
+	}
+}
