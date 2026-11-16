@@ -26,12 +26,12 @@ note over App, DB
 end note
 
 == Register ==
-User -> Client : Register(username, display_name, email, credentials)
+User -> Client : Register(username, display_name, email, password)
 Client -> ClientApp : Users.Register
 ClientApp -> Remote : Register(request)
 Remote -> API : Public request over TLS; no session required
 API -> App : Users.Register(validated DTO)
-App -> App : CredentialVerifier prepares verifier data\nvia internal/credentials (method OPEN)
+App -> App : CredentialVerifier hashes password with salt\nvia internal/credentials (hash parameters OPEN)
 App -> Repo : WithinTransaction
 Repo -> DB : BEGIN
 App -> Domain : Validate identity and personal workspace invariants

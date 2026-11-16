@@ -75,7 +75,7 @@ package "document-service owns: PostgreSQL" {
   entity "user_credentials" as Credentials {
     * user_id : UUID <<FK>>
     --
-    method / verifier_data / credential_version
+    password_hash / credential_version
   }
   entity "workspaces" as Workspaces {
     * id : UUID <<PK>>
@@ -200,8 +200,8 @@ participant "notification-service" as HNS
 database "Notification PostgreSQL" as Inbox
 
 == Login ==
-Client -> HDS : Authenticate(credentials)
-HDS -> Domain : Verify active account and credentials
+Client -> HDS : Authenticate(username, password)
+HDS -> Domain : Verify active account and password hash
 HDS -> Redis : Create session against current enabled auth epoch
 Redis --> HDS : Persisted
 HDS --> Client : Opaque token + expires_at

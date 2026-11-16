@@ -29,8 +29,8 @@ class "Error response" as Error {
 }
 package "CLI -> document-service: example payloads" {
   class Authenticate {
-    credentials.method: string
-    credentials.proof: object (OPEN)
+    username: string
+    password: string (secret)
   }
   class UpdateDocument {
     document_id: ID

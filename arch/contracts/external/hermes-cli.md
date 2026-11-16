@@ -62,11 +62,10 @@ headers/metadata, отдельно от payload; конкретное имя з�
 | DocumentSummary | id: ID, workspace_id: ID, title: string, version: Version |
 | Document | поля DocumentSummary + content: string (Markdown) |
 | Subscription | document_id: ID, enabled: boolean |
-| Credentials | method: string, proof: object; поля proof OPEN, зависят от выбранной аутентификации |
 | IdentityConfirmation | method: string, proof: object; подтверждение личности для опасной операции, формат OPEN |
 
 Это DTO сообщения, а не сериализация внутренних структур Go.
-Credentials.Secret, SessionKey, ServerIdentity, Draft, RecoveryPath, локальные пути,
+Credentials.Password, SessionKey, ServerIdentity, Draft, RecoveryPath, локальные пути,
 context.Context и Go error через сеть не передаются. ServerIdentity задаётся локальной
 конфигурацией; UserID/Token/ExpiresAt ответа Authenticate адаптер преобразует в Session.
 Пустой изменяемый заголовок и имя валидируются сервером; отсутствие patch-поля означает
@@ -80,8 +79,8 @@ context.Context и Go error через сеть не передаются. Serve
 
 | Запрос | Payload запроса | Ответ | Сессия |
 | --- | --- | --- | --- |
-| Register | username, display_name, email: string; credentials: Credentials | profile: Profile, personal_workspace: Workspace | Нет |
-| Authenticate | credentials: Credentials | user_id: ID, token: string, expires_at: Timestamp | Нет |
+| Register | username: string, display_name: string, email: string, password: string | profile: Profile, personal_workspace: Workspace | Нет |
+| Authenticate | username: string, password: string | user_id: ID, token: string, expires_at: Timestamp | Нет |
 | Logout | {} | {} после подтверждённого отзыва/отсутствия сессии | Отзываемый токен; отсутствие/истечение допустимо |
 | GetSelf | {} | profile: Profile | Да |
 | GetPublicProfile | user_id: ID целевого пользователя | profile: PublicProfile | Да |
@@ -92,8 +91,9 @@ context.Context и Go error через сеть не передаются. Serve
 | DeleteSelf | expected_version: Version, confirmation: IdentityConfirmation | {} только после подтверждённого удаления и отзыва сессий | Да |
 
 Регистрация атомарно создаёт пользователя, личное пространство и owner membership,
-но не выполняет вход. Способ передачи/подтверждения credentials и исходная email
-verification OPEN. GetPublicProfile ограничен общей активной membership.
+но не выполняет вход. Логин — username, сравниваемый без учёта регистра; пароль
+проверяется точно. Вход по email не предусмотрен. Способ выбран в
+[ADR-004](../../decisions/004-password-authentication.md); исходная email verification OPEN. GetPublicProfile ограничен общей активной membership.
 RequestEmailChange сохраняет запрос, а не меняет email. ConfirmEmail меняет email
 только после проверки одноразового секрета, срока и уникальности; секрет не логируется.
 Предварительные deletion blockers не отменяют повторных проверок при DeleteSelf.
@@ -106,7 +106,7 @@ RequestEmailChange сохраняет запрос, а не меняет email. 
 
 | Запрос | Payload запроса | Ответ |
 | --- | --- | --- |
-| CreateWorkspace | name, description: string | workspace: Workspace |
+| CreateWorkspace | name: string, description: string | workspace: Workspace |
 | ListWorkspaces | page: PageInput | page: Page<Workspace> |
 | GetWorkspace | workspace_id: ID | workspace: Workspace |
 | UpdateWorkspace | workspace_id: ID, name?: string, description?: string, expected_version: Version | workspace: Workspace |
@@ -154,6 +154,93 @@ BeginEdit, SaveEdit, CompareLatest, RebaseDraft и DiscardDraft — внутре
 Они используют GetDocument/UpdateDocument и локальный DraftStore; отдельных серверных
 сообщений BeginEdit, RebaseDraft или LaunchEditor не требуется.
 
+## Правила обработки запросов document-service
+
+Этот раздел уточняет проект каталога выше; он не означает, что сервер или сетевой
+адаптер уже реализован. Все поля payload обязательны, если не помечены `?`.
+Пустой результат операции передаётся как `{}`, пустой список — как `items: []`.
+`null` не заменяет отсутствие optional-поля. ID, токены и cursor непрозрачны для CLI.
+Сервер задаёт идентификаторы, версии и сроки действия; клиент их не генерирует.
+Пустой текст документа и пустое описание допустимы; заголовок документа и имя
+пространства не могут быть пустыми. Точные лимиты строк и правила нормализации OPEN.
+
+Для UpdateSelf и UpdateWorkspace требуется хотя бы одно изменяемое поле.
+Переданное пустое описание очищает описание; пропущенное оставляет его прежним.
+UpdateDocument — полная замена title/content, а не patch. workspace_id документа
+через него изменить нельзя. Первую версию создаваемых объектов предлагается считать 1.
+
+Проверка сессии и актуального доступа предшествует раскрытию состояния объекта.
+Проверка expected_version и запись выполняются атомарно: устаревшая версия возвращает
+conflict даже при совпадении присланного текста с текущим. Успешное изменение увеличивает
+версию объекта; no-op сохраняет её. UpdateDocument возвращает changed=false только
+после успешных проверок доступа и версии. Подтверждение удаления не заменяет эти проверки.
+expected_version относится к Profile для UpdateSelf/RequestEmailChange/DeleteSelf,
+Workspace для UpdateWorkspace/TransferOwnership/DeleteWorkspace и Document для
+UpdateDocument/DeleteDocument. Запрос смены email не считается подтверждённой сменой
+профиля; момент увеличения версии для pending-запроса ещё нужно согласовать.
+
+### Доступ и предметные отказы
+
+Таблица дополняет поля сообщений. Общие ошибки validation, unauthenticated,
+unavailable и outcome_unknown определены ниже и здесь не повторяются.
+Выбор denied или скрывающего существование not_found должен быть единым для
+конкретного класса объектов; точная политика раскрытия OPEN.
+
+| Операции | Проверки и предметные отказы |
+| --- | --- |
+| Register | Уникальность username/email без учёта регистра; конфликт уникальности — conflict. Личное пространство и membership создаются в одной транзакции с профилем |
+| Authenticate | Проверка username/password; неверные учётные данные — unauthenticated без раскрытия существования пользователя. Одного username недостаточно |
+| Logout | Отзывается предъявленный токен. Уже отсутствующая или истёкшая сессия даёт success; недоступность Redis не выдаётся за подтверждённый отзыв |
+| GetSelf, UpdateSelf, RequestEmailChange | Только собственный профиль. UpdateSelf и RequestEmailChange проверяют версию; занятые username/email — conflict |
+| GetPublicProfile | Только публичные поля пользователя с общим активным членством; email и credentials не выдаются |
+| ConfirmEmail | Проверить срок, одноразовость и назначение секрета, повторно проверить уникальность email. Недействительный секрет — validation; занятый email — conflict. Поведение повтора после успеха OPEN |
+| GetDeletionBlockers, DeleteSelf | Blockers — только общие пространства, которыми владеет пользователь. Наличие blockers при DeleteSelf — conflict; подтверждение личности и версия проверяются заново |
+| CreateWorkspace, ListWorkspaces, GetWorkspace | Создаётся shared-пространство с actor как owner; список содержит только доступные пространства, включая личное |
+| UpdateWorkspace | Owner/admin; личное пространство меняет только владелец; устаревшая версия — conflict |
+| ListMembers | Только участник соответствующего пространства |
+| ListInvitations | Только приглашения, адресованные текущему пользователю; выдача pending/истории и порядок пока OPEN |
+| InviteMember | Только shared. Owner приглашает admin/editor/viewer, admin — editor/viewer; существующее членство или pending-приглашение — conflict |
+| RespondToInvitation | Только адресат, pending и неистёкшее приглашение в активное пространство. Смена состояния и создание membership при accept атомарны; устаревшее состояние — conflict |
+| RevokeInvitation | Проверить актуальные права управления и pending-состояние; accept/revoke/expiry сериализуются. Политика отзыва приглашения на роль admin требует уточнения |
+| ChangeRole, RemoveMember | Только shared; owner управляет admin/editor/viewer, admin — editor/viewer. Owner защищён от обычной смены роли и исключения |
+| LeaveWorkspace | Только shared, текущий участник, кроме owner. Владелец сначала передаёт владение или удаляет пространство |
+| TransferOwnership | Только текущий owner shared-пространства; новый владелец — активный участник. Проверить версию; прежний owner становится admin в той же транзакции |
+| DeleteWorkspace | Только owner shared-пространства, актуальная версия и confirmed=true. Атомарно закрыть доступ к документам, членствам и приглашениям |
+| ListDocuments, SearchDocuments, GetDocument | Только актуальные читатели. Без workspace_id поиск/список охватывают доступные пространства; с явным workspace_id сначала проверяется доступ к нему |
+| CreateDocument, UpdateDocument, DeleteDocument | Owner/admin/editor соответствующего пространства. Для обновления/удаления проверить версию; удаление требует confirmed=true |
+| SubscribeDocument, UnsubscribeDocument | Любой актуальный читатель; меняется подписка только текущего пользователя. Повтор уже установленного состояния — success без нового изменения |
+
+Ни одна мутация не принимает actor_id, created_by, updated_by или собственную роль
+вызывающего. user_id/invitee_id/new_owner_id — идентификаторы целей операции.
+Register и Authenticate передают секреты только по защищённому соединению; их payload
+и успешный Authenticate с token исключаются из логирования. Действительность
+confirmation_token не заменяет session token в других операциях.
+
+### Списки и поиск
+
+Ответ списка всегда имеет вид `payload: {page: {items: [...], next_cursor?: Cursor}}`.
+Для первого запроса CLI передаёт `page: {}` либо page с limit; следующий запрос
+использует полученный cursor, ту же operation и те же фильтры. Cursor не даёт прав:
+сервер заново ограничивает выдачу текущим доступом. Невалидный cursor — validation;
+срок жизни cursor и поведение при изменении фильтров OPEN.
+Сортировка, семантика поиска (по заголовку/тексту, регистр, язык), обработка пустого query,
+максимум limit и согласованность страниц пока не закреплены контрактом.
+
+### Успех, повтор и неизвестный исход
+
+Успешный ответ на изменение подтверждает предметный результат, но не получение
+уведомления другими клиентами и не завершение Kafka/WebSocket-доставки.
+DeleteSelf имеет дополнительное условие подтверждённого отзыва сессий, указанное выше.
+Успешное удаление возвращает `{}`, а не удалённый документ или список его получателей.
+
+request_id служит корреляции и не предотвращает повторное выполнение. Автоматический
+повтор создания, принятия приглашения, передачи владения и удаления пока не разрешён
+этим контрактом. Повторяемое чтение также не обещает тот же снимок данных.
+После неизвестного исхода UpdateDocument CLI сохраняет черновик и может запросить
+GetDocument для сравнения: совпадение текста само по себе не доказывает, кто выполнил
+изменение. После неизвестного исхода DeleteSelf/Logout нельзя заявлять подтверждённый
+серверный отзыв. Протокол идемпотентности и отдельный запрос статуса операции OPEN.
+
 ## Ошибки document-service → CLI
 
 `Error = {code: string, message: string, field_errors?: FieldError[],
@@ -182,6 +269,86 @@ DeleteSelf и обновления настроек. При отсутствии
 (также при отмене context); черновик сохраняется. Ошибки файлов, редактора и cleanup
 остаются внутренними. Идемпотентность, retry-after, сопоставление HTTP/gRPC статусов
 и восстановление неизвестного исхода OPEN.
+
+### Пример: вход
+
+Запрос Authenticate передаёт username и password. Пароль CLI получает скрытым вводом,
+не аргументом командной строки. Пример содержит вымышленные данные:
+
+```json
+{
+  "schema_version": 1,
+  "request_id": "req-auth-1",
+  "operation": "Authenticate",
+  "payload": {
+    "username": "microice",
+    "password": "example-only-not-a-real-password"
+  }
+}
+```
+
+Register передаёт `payload: {username, display_name, email, password}`; пароль
+не возвращается в Profile. Сервер хранит только солёный хеш пароля.
+Текущая CLI-команда `auth <username>` остаётся заглушкой.
+После успешной проверки сервер отвечает (значение token ниже вымышленное):
+
+```json
+{
+  "schema_version": 1,
+  "request_id": "req-auth-1",
+  "operation": "Authenticate",
+  "status": "success",
+  "payload": {
+    "user_id": "user-12",
+    "token": "example-only-not-a-real-token",
+    "expires_at": "2026-11-17T12:00:00Z"
+  }
+}
+```
+
+CLI сохраняет сессию локально и передаёт токен в защищённых headers/metadata
+последующих запросов. Токен не включается в payload GetSelf или GetDocument.
+
+### Пример: список документов
+
+```json
+{
+  "schema_version": 1,
+  "request_id": "req-list-1",
+  "operation": "ListDocuments",
+  "payload": {
+    "workspace_id": "ws-9",
+    "page": {"limit": 20}
+  }
+}
+```
+
+```json
+{
+  "schema_version": 1,
+  "request_id": "req-list-1",
+  "operation": "ListDocuments",
+  "status": "success",
+  "payload": {
+    "page": {
+      "items": [
+        {
+          "id": "doc-42",
+          "workspace_id": "ws-9",
+          "title": "План проекта",
+          "version": 7
+        }
+      ],
+      "next_cursor": "example-opaque-cursor"
+    }
+  }
+}
+```
+
+Лимит 20 — пример, не установленный серверный предел. Для продолжения передаётся
+`page: {limit: 20, cursor: "example-opaque-cursor"}` с тем же workspace_id.
+GetDocument с `payload: {document_id: "doc-42"}` вернёт `payload: {document: ...}`:
+те же поля DocumentSummary и полный content. В списке полного content нет.
 
 ### Пример: сохранение документа и конфликт
 

@@ -56,8 +56,8 @@ type SessionKey struct {
 	UserID ID
 }
 type Credentials struct {
-	Method string
-	Secret []byte // Method-specific input; never log or persist in drafts/config.
+	Username string
+	Password []byte // Hidden input; never log or persist in drafts/config.
 }
 type Session struct {
 	Key       SessionKey
@@ -118,7 +118,7 @@ type RegisterInput struct {
 	Username    string
 	DisplayName string
 	Email       string
-	Credentials Credentials
+	Password    []byte // Registration password; never log or persist.
 }
 type Registration struct {
 	Profile           Profile
@@ -336,7 +336,7 @@ type ContractError interface {
   Политика конкурирующих изменений несколькими процессами пока не определена.
 - Выбор пространства локальный: он сохраняется после успешного чтения, но не даёт
   прав. Явный workspace параметр операции имеет приоритет над ConfigStore.
-- Конкретный способ credentials, подтверждения личности и срок сессии открыты.
+- Вход — username/password (ADR-004); подтверждение личности при удалении и срок сессии открыты.
   Credentials/IdentityConfirmation — временные входные данные, не файлы конфигурации.
 - Успешный RequestEmailChange означает сохранённый запрос подтверждения, а не смену
   email. Успешный DeleteSelf означает подтверждённые удаление и отзыв сессий; при
