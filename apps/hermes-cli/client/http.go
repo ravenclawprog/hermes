@@ -114,3 +114,72 @@ func (c *HTTPClient) Authenticate(
 		return Session{}, fmt.Errorf("unknown authentication response status")
 	}
 }
+
+func (c *HTTPClient) List(
+	ctx context.Context,
+	session Session,
+) (DocumentPage, error) {
+	requestIDBytes := make([]byte, 16)
+	if _, err := rand.Read(requestIDBytes); err != nil {
+		return DocumentPage{}, fmt.Errorf("generate request ID: %w", err)
+	}
+	request := documentListRequest{
+		SchemaVersion: 1,
+		RequestID:     hex.EncodeToString(requestIDBytes),
+		Operation:     "ListDocuments",
+	}
+
+	body, err := json.Marshal(request)
+	if err != nil {
+		return DocumentPage{}, fmt.Errorf("encode document list request: %w", err)
+	}
+
+	httpRequest, err := http.NewRequestWithContext(
+		ctx,
+		http.MethodPost,
+		c.baseURL+"/document/list",
+		bytes.NewReader(body),
+	)
+	if err != nil {
+		return DocumentPage{}, fmt.Errorf("create document list request: %w", err)
+	}
+
+	httpRequest.Header.Set("Content-Type", "application/json")
+	httpRequest.Header.Set("Authorization", "Bearer "+session.Token)
+
+	response, err := c.httpClient.Do(httpRequest)
+	if err != nil {
+		return DocumentPage{}, fmt.Errorf("send document list request: %w", err)
+	}
+	defer response.Body.Close()
+
+	var result documentListResponse
+
+	if err := json.NewDecoder(response.Body).Decode(&result); err != nil {
+		return DocumentPage{}, fmt.Errorf("decode document list response: %w", err)
+	}
+
+	if result.SchemaVersion != 1 ||
+		result.RequestID != request.RequestID ||
+		result.Operation != request.Operation {
+		return DocumentPage{}, fmt.Errorf("invalid document list response envelope")
+	}
+
+	switch result.Status {
+	case "error":
+		if result.Error == nil || result.Payload != nil || result.Error.Code == "" {
+			return DocumentPage{}, fmt.Errorf("invalid document list error response")
+		}
+		return DocumentPage{}, &APIError{Code: result.Error.Code}
+	case "success":
+		if response.StatusCode != http.StatusOK {
+			return DocumentPage{}, fmt.Errorf("unexpected document list HTTP status: %d", response.StatusCode)
+		}
+		if result.Error != nil || result.Payload == nil || result.Payload.Page == nil || result.Payload.Page.Items == nil {
+			return DocumentPage{}, fmt.Errorf("invalid document list success response")
+		}
+		return *result.Payload.Page, nil
+	default:
+		return DocumentPage{}, fmt.Errorf("unknown document list response status")
+	}
+}

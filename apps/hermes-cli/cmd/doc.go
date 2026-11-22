@@ -2,69 +2,51 @@ package cmd
 
 import (
 	"fmt"
-	"hermes-cli/editor"
+	"hermes-cli/client"
 
 	"github.com/spf13/cobra"
 )
 
-var docCmd = &cobra.Command{
-	Use:   "doc",
-	Short: "document managment",
-}
+func newDocCmd(
+	docServClient client.DocumentClient,
+	sessionStore client.SessionStore,
+) *cobra.Command {
+	doc := &cobra.Command{
+		Use:   "doc",
+		Short: "Commands with documents"}
+	doc.AddCommand(&cobra.Command{
+		Use: "list",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			if docServClient == nil {
+				return fmt.Errorf("set HERMES_SERVER_URL to the document-service address")
+			}
+			if sessionStore == nil {
+				return fmt.Errorf("session store is not configured")
+			}
+			session, err := sessionStore.Load(cmd.Context())
+			if err != nil {
+				return fmt.Errorf("cannot load session: %w", err)
+			}
+			page, err := docServClient.List(cmd.Context(), session)
+			if err != nil {
+				return fmt.Errorf("list documents: %w", err)
+			}
+			for _, document := range page.Items {
+				if _, err := fmt.Fprintf(cmd.OutOrStdout(), "%s\t%s\t%s\t%d\n",
+					document.ID, document.WorkspaceID, document.Title, document.Version); err != nil {
+					return fmt.Errorf("write document list: %w", err)
+				}
+			}
 
-var listCmd = &cobra.Command{
-	Use:   "list",
-	Short: "Show list of availaible docs",
-	Run: func(cmd *cobra.Command, args []string) {
-		// TODO: query for list of docs
-		fmt.Fprintln(cmd.OutOrStdout(), "Doc list: [...]")
-	},
-}
-
-var editCmd = &cobra.Command{
-	Use:   "edit [document_id]",
-	Short: "Edit documt at system editor",
-	Args:  cobra.ExactArgs(1),
-	Run: func(cmd *cobra.Command, args []string) {
-		docID := args[0]
-		fmt.Fprintln(cmd.OutOrStdout(), "Open docs ", docID, " for editoring")
-
-		// stub
-		stubRemoteContent := "Hello, Hermes! Edit this line."
-
-		// calling editor
-		updatedContent, err := editor.OpenInSystemEditor(stubRemoteContent)
-		if err != nil {
-			fmt.Printf("failed to open editor: %v", err)
-			return
-		}
-
-		fmt.Fprintln(cmd.OutOrStdout(), "\n--- Document updated successfully! ---")
-		fmt.Fprintln(cmd.OutOrStdout(), updatedContent)
-	},
-}
-var readCmd = &cobra.Command{
-	Use:   "read [document_id]",
-	Short: "Read and display document content",
-	Args:  cobra.ExactArgs(1),
-	RunE: func(cmd *cobra.Command, args []string) error {
-		docID := args[0]
-		fmt.Fprintf(cmd.OutOrStdout(), "Fetching document %s...\n", docID)
-
-		stubRemoteContent := "Hello, Hermes! This is the document content."
-		stubVersion := int64(1)
-
-		fmt.Fprintln(cmd.OutOrStdout(), "\n--- Document Content ---")
-		fmt.Fprintln(cmd.OutOrStdout(), stubRemoteContent)
-		fmt.Fprintf(cmd.OutOrStdout(), "------------------------\n[Version: %d]\n", stubVersion)
-
-		return nil
-	},
-}
-
-func init() {
-	docCmd.AddCommand(listCmd)
-	docCmd.AddCommand(editCmd)
-	docCmd.AddCommand(readCmd)
-	rootCmd.AddCommand(docCmd)
+			return nil
+		},
+	})
+	// &cobra.Command{
+	// 	Use:  "read <document_id>",
+	// 	Args: cobra.ExactArgs(1),
+	// 	RunE: func(cmd *cobra.Command, args []string) error {
+	// 		return RunDocRead(cmd, docServClient, args[0])
+	// 	},
+	// })
+	return doc
 }

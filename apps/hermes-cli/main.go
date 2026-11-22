@@ -8,7 +8,7 @@ import (
 
 func main() {
 	if err := cmd.Execute(); err != nil {
-		fmt.Fprintf(os.Stderr, "Ошибка при выполнении команды: %v\n", err)
+		fmt.Fprintf(os.Stderr, "Error at execution: %v\n", err)
 		os.Exit(1)
 	}
 }

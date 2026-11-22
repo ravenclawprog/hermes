@@ -5,7 +5,8 @@ import (
 	"os/exec"
 )
 
-// OpenInSystemEditor create temporary file for editing docs
+// OBSOLETE MODULE, NEED TO REWORK
+
 func OpenInSystemEditor(initialContent string) (string, error) {
 	editor := os.Getenv("EDITOR")
 	if editor == "" {

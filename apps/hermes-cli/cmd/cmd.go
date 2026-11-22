@@ -14,8 +14,12 @@ var rootCmd = &cobra.Command{
 	Long:  "Console client for managing, creating and editoring remote docs at real time",
 }
 
+func readPassword() ([]byte, error) {
+	return term.ReadPassword(int(os.Stdin.Fd()))
+}
+
 func Execute() error {
-	var authClient client.AuthClient
+	var connectionClient *client.HTTPClient
 	var sessionStore client.SessionStore
 
 	if serverURL := os.Getenv("HERMES_SERVER_URL"); serverURL != "" {
@@ -24,21 +28,12 @@ func Execute() error {
 			return err
 		}
 
-		authClient = client.NewHTTPClient(serverURL)
+		connectionClient = client.NewHTTPClient(serverURL)
 		sessionStore = store
 	}
 
-	rootCmd.AddCommand(newAuthCmd(
-		authClient,
-		sessionStore,
-		func() ([]byte, error) {
-			return term.ReadPassword(int(os.Stdin.Fd()))
-		},
-	))
+	rootCmd.AddCommand(newAuthCmd(connectionClient, sessionStore, readPassword))
+	rootCmd.AddCommand(newDocCmd(connectionClient, sessionStore))
 
 	return rootCmd.Execute()
-}
-
-func init() {
-	// var verbose bool
 }

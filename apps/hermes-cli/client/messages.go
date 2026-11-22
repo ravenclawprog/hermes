@@ -33,3 +33,27 @@ type authenticateResponse struct {
 	Payload       *authenticateResult `json:"payload"`
 	Error         *responseError      `json:"error"`
 }
+
+type documentListRequest struct {
+	SchemaVersion int                 `json:"schema_version"`
+	RequestID     string              `json:"request_id"`
+	Operation     string              `json:"operation"`
+	Payload       documentListPayload `json:"payload"`
+}
+
+type documentListPayload struct {
+	Page struct{} `json:"page"`
+}
+
+type documentListResult struct {
+	Page *DocumentPage `json:"page"`
+}
+
+type documentListResponse struct {
+	SchemaVersion int                 `json:"schema_version"`
+	RequestID     string              `json:"request_id"`
+	Operation     string              `json:"operation"`
+	Status        string              `json:"status"`
+	Payload       *documentListResult `json:"payload"`
+	Error         *responseError      `json:"error"`
+}
