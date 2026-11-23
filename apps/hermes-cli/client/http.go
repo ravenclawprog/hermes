@@ -183,3 +183,75 @@ func (c *HTTPClient) List(
 		return DocumentPage{}, fmt.Errorf("unknown document list response status")
 	}
 }
+
+func (c *HTTPClient) Read(
+	ctx context.Context,
+	session Session,
+	documentID string,
+) (Document, error) {
+	requestIDBytes := make([]byte, 16)
+	if _, err := rand.Read(requestIDBytes); err != nil {
+		return Document{}, fmt.Errorf("generate request ID: %w", err)
+	}
+	request := documentReadRequest{
+		SchemaVersion: 1,
+		RequestID:     hex.EncodeToString(requestIDBytes),
+		Operation:     "GetDocument",
+		Payload:       documentReadPayload{DocumentID: documentID},
+	}
+
+	body, err := json.Marshal(request)
+	if err != nil {
+		return Document{}, fmt.Errorf("encode document read request: %w", err)
+	}
+
+	httpRequest, err := http.NewRequestWithContext(
+		ctx,
+		http.MethodPost,
+		c.baseURL+"/document/read",
+		bytes.NewReader(body),
+	)
+	if err != nil {
+		return Document{}, fmt.Errorf("create document read request: %w", err)
+	}
+
+	httpRequest.Header.Set("Content-Type", "application/json")
+	httpRequest.Header.Set("Authorization", "Bearer "+session.Token)
+
+	response, err := c.httpClient.Do(httpRequest)
+	if err != nil {
+		return Document{}, fmt.Errorf("send document read request: %w", err)
+	}
+	defer response.Body.Close()
+
+	var result documentReadResponse
+
+	if err := json.NewDecoder(response.Body).Decode(&result); err != nil {
+		return Document{}, fmt.Errorf("decode document read response: %w", err)
+	}
+
+	if result.SchemaVersion != 1 ||
+		result.RequestID != request.RequestID ||
+		result.Operation != request.Operation {
+		return Document{}, fmt.Errorf("invalid document read response envelope")
+	}
+
+	switch result.Status {
+	case "error":
+		if result.Error == nil || result.Payload != nil || result.Error.Code == "" {
+			return Document{}, fmt.Errorf("invalid document read error response")
+		}
+		return Document{}, &APIError{Code: result.Error.Code}
+	case "success":
+		if response.StatusCode != http.StatusOK {
+			return Document{}, fmt.Errorf("unexpected document read HTTP status: %d", response.StatusCode)
+		}
+		if result.Error != nil || result.Payload == nil || result.Payload.Document == nil {
+			return Document{}, fmt.Errorf("invalid document read success response")
+		}
+		document := result.Payload.Document
+		return Document{Summary: document.DocumentSummary, Content: document.Content}, nil
+	default:
+		return Document{}, fmt.Errorf("unknown document read response status")
+	}
+}

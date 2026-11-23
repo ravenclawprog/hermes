@@ -18,6 +18,11 @@ type DocumentSummary struct {
 	Version     int64  `json:"version"`
 }
 
+type Document struct {
+	Summary DocumentSummary `json:"summary"`
+	Content string          `json:"content"`
+}
+
 type DocumentPage struct {
 	Items      []DocumentSummary `json:"items"`
 	NextCursor string            `json:"next_cursor,omitempty"`
@@ -36,4 +41,9 @@ type DocumentClient interface {
 		ctx context.Context,
 		session Session,
 	) (DocumentPage, error)
+	Read(
+		ctx context.Context,
+		session Session,
+		documentID string,
+	) (Document, error)
 }

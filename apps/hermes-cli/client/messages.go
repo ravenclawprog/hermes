@@ -57,3 +57,30 @@ type documentListResponse struct {
 	Payload       *documentListResult `json:"payload"`
 	Error         *responseError      `json:"error"`
 }
+
+type documentReadRequest struct {
+	SchemaVersion int                 `json:"schema_version"`
+	RequestID     string              `json:"request_id"`
+	Operation     string              `json:"operation"`
+	Payload       documentReadPayload `json:"payload"`
+}
+
+type documentReadPayload struct {
+	DocumentID string `json:"document_id"`
+}
+
+type documentReadResult struct {
+	Document *struct {
+		DocumentSummary
+		Content string `json:"content"`
+	} `json:"document"`
+}
+
+type documentReadResponse struct {
+	SchemaVersion int                 `json:"schema_version"`
+	RequestID     string              `json:"request_id"`
+	Operation     string              `json:"operation"`
+	Status        string              `json:"status"`
+	Payload       *documentReadResult `json:"payload"`
+	Error         *responseError      `json:"error"`
+}

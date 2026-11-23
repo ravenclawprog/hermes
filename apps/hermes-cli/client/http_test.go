@@ -223,3 +223,62 @@ func TestListDocuments(t *testing.T) {
 		})
 	}
 }
+
+func TestReadDocument(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		payload string
+	}{
+		{"document", `{"document":{"id":"doc-42","workspace_id":"ws-9","title":"План","version":7,"content":"# План\n"}}`},
+		{"missing document", `{}`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.Method != http.MethodPost || r.URL.Path != "/document/read" {
+					t.Errorf("unexpected request %s %s", r.Method, r.URL.Path)
+				}
+				if r.Header.Get("Authorization") != "Bearer test-token" || r.Header.Get("Content-Type") != "application/json" {
+					t.Error("unexpected authorization or content type")
+				}
+				var request map[string]any
+				if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+					t.Errorf("decode request: %v", err)
+					w.WriteHeader(http.StatusBadRequest)
+					return
+				}
+				requestID, _ := request["request_id"].(string)
+				wantRequest := map[string]any{
+					"schema_version": float64(1),
+					"request_id":     requestID,
+					"operation":      "GetDocument",
+					"payload":        map[string]any{"document_id": "doc-42"},
+				}
+				if requestID == "" || !reflect.DeepEqual(request, wantRequest) {
+					t.Errorf("unexpected document read request: %#v", request)
+				}
+				if _, err := fmt.Fprintf(w, `{"schema_version":1,"request_id":%q,"operation":"GetDocument","status":"success","payload":%s}`, requestID, tc.payload); err != nil {
+					t.Errorf("write response: %v", err)
+				}
+			}))
+			defer server.Close()
+
+			document, err := NewHTTPClient(server.URL).Read(context.Background(), Session{Token: "test-token"}, "doc-42")
+			if tc.name == "missing document" {
+				if err == nil || err.Error() != "invalid document read success response" {
+					t.Fatalf("expected invalid success response error, got %v", err)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			want := Document{
+				Summary: DocumentSummary{ID: "doc-42", WorkspaceID: "ws-9", Title: "План", Version: 7},
+				Content: "# План\n",
+			}
+			if document != want {
+				t.Errorf("got document %+v, want %+v", document, want)
+			}
+		})
+	}
+}

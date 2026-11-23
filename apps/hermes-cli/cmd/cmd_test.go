@@ -35,20 +35,6 @@ func (sessionStoreFunc) Load(context.Context) (client.Session, error) {
 	return client.Session{}, errors.New("unexpected session load in auth test")
 }
 
-// wrapping stdout by buffer
-func executeCommand(args ...string) (string, error) {
-	buf := new(bytes.Buffer)
-
-	// getting root command
-	root := rootCmd
-	root.SetOut(buf)
-	root.SetErr(buf)
-	root.SetArgs(args)
-
-	// execution
-	err := root.Execute()
-	return buf.String(), err
-}
 func TestAuthCmdRequiresUsername(t *testing.T) {
 	readCalled := false
 
@@ -137,9 +123,24 @@ func TestAuthCmdSuccessfulAuth(t *testing.T) {
 }
 
 func TestAuthCmdFailedAuth(t *testing.T) {
-	_, err := executeCommand("auth")
-	if err == nil {
-		t.Error("want: error, but got:nothing (successfull auth without auth)")
+	rejected := &client.APIError{Code: "unauthenticated"}
+	authClient := authClientFunc(func(context.Context, string, []byte) (client.Session, error) {
+		return client.Session{}, rejected
+	})
+	store := sessionStoreFunc(func(context.Context, client.Session) error {
+		t.Fatal("must not save a session after failed authentication")
+		return nil
+	})
+	command := newAuthCmd(authClient, store, func() ([]byte, error) {
+		return []byte("test-password"), nil
+	})
+	var output bytes.Buffer
+	command.SetOut(&output)
+	command.SetErr(&output)
+	command.SetArgs([]string{"alice"})
+
+	if err := command.Execute(); !errors.Is(err, rejected) {
+		t.Fatalf("expected authentication error, got %v", err)
 	}
 }
 
@@ -147,6 +148,10 @@ type documentClientFunc func(context.Context, client.Session) (client.DocumentPa
 
 func (f documentClientFunc) List(ctx context.Context, session client.Session) (client.DocumentPage, error) {
 	return f(ctx, session)
+}
+
+func (documentClientFunc) Read(context.Context, client.Session, string) (client.Document, error) {
+	return client.Document{}, errors.New("unexpected Read call")
 }
 
 func TestDocListCmd(t *testing.T) {
