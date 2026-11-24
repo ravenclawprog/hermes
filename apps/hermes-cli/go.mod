@@ -10,3 +10,7 @@ require (
 	golang.org/x/sys v0.50.0 // indirect
 	golang.org/x/term v0.48.0 // indirect
 )
+
+require hermes-messages v0.0.0
+
+replace hermes-messages => ../../packages/hermes-messages

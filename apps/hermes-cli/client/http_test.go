@@ -10,6 +10,8 @@ import (
 	"reflect"
 	"testing"
 	"time"
+
+	"hermes-messages"
 )
 
 func TestAuthenticateSuccess(t *testing.T) {
@@ -22,7 +24,7 @@ func TestAuthenticateSuccess(t *testing.T) {
 			return
 		}
 
-		var request authenticateRequest
+		var request messages.Request[messages.AuthenticateInput]
 		if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
 			t.Error("invalid request JSON")
 			w.WriteHeader(http.StatusBadRequest)
@@ -37,12 +39,10 @@ func TestAuthenticateSuccess(t *testing.T) {
 		}
 
 		w.Header().Set("Content-Type", "application/json")
-		err := json.NewEncoder(w).Encode(authenticateResponse{
-			SchemaVersion: 1,
-			RequestID:     request.RequestID,
-			Operation:     request.Operation,
-			Status:        "success",
-			Payload: &authenticateResult{
+		err := json.NewEncoder(w).Encode(messages.Response[messages.AuthenticateResult]{
+			Envelope: request.Envelope,
+			Status:   "success",
+			Payload: &messages.AuthenticateResult{
 				UserID:    "user-1",
 				Token:     "test-token",
 				ExpiresAt: expiresAt,
@@ -73,7 +73,7 @@ func TestAuthenticateSuccess(t *testing.T) {
 
 func TestAuthenticateInvalidCredentials(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		var request authenticateRequest
+		var request messages.Request[messages.AuthenticateInput]
 		if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
 			t.Error("invalid request JSON")
 			w.WriteHeader(http.StatusBadRequest)
@@ -83,12 +83,10 @@ func TestAuthenticateInvalidCredentials(t *testing.T) {
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusUnauthorized)
 
-		err := json.NewEncoder(w).Encode(authenticateResponse{
-			SchemaVersion: 1,
-			RequestID:     request.RequestID,
-			Operation:     request.Operation,
-			Status:        "error",
-			Error: &responseError{
+		err := json.NewEncoder(w).Encode(messages.Response[messages.AuthenticateResult]{
+			Envelope: request.Envelope,
+			Status:   "error",
+			Error: &messages.Error{
 				Code:    "unauthenticated",
 				Message: "Invalid username or password",
 			},

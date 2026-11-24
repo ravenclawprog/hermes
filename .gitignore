@@ -1,3 +1,5 @@
 **/.task/
 **/bin/
 **/go.sum
+
+/.env

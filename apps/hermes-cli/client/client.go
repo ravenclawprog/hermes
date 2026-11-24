@@ -3,6 +3,8 @@ package client
 import (
 	"context"
 	"time"
+
+	"hermes-messages"
 )
 
 type Session struct {
@@ -11,22 +13,14 @@ type Session struct {
 	ExpiresAt time.Time
 }
 
-type DocumentSummary struct {
-	ID          string `json:"id"`
-	WorkspaceID string `json:"workspace_id"`
-	Title       string `json:"title"`
-	Version     int64  `json:"version"`
-}
+type DocumentSummary = messages.DocumentSummary
 
 type Document struct {
 	Summary DocumentSummary `json:"summary"`
 	Content string          `json:"content"`
 }
 
-type DocumentPage struct {
-	Items      []DocumentSummary `json:"items"`
-	NextCursor string            `json:"next_cursor,omitempty"`
-}
+type DocumentPage = messages.DocumentPage
 
 type AuthClient interface {
 	Authenticate(

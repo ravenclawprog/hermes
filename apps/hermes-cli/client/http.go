@@ -9,6 +9,8 @@ import (
 	"fmt"
 	"net/http"
 	"time"
+
+	"hermes-messages"
 )
 
 type HTTPClient struct {
@@ -34,11 +36,13 @@ func (c *HTTPClient) Authenticate(
 	if _, err := rand.Read(requestIDBytes); err != nil {
 		return Session{}, fmt.Errorf("generate request ID: %w", err)
 	}
-	request := authenticateRequest{
-		SchemaVersion: 1,
-		RequestID:     hex.EncodeToString(requestIDBytes),
-		Operation:     "Authenticate",
-		Payload: authenticatePayload{
+	request := messages.Request[messages.AuthenticateInput]{
+		Envelope: messages.Envelope{
+			SchemaVersion: messages.SchemaVersion,
+			RequestID:     hex.EncodeToString(requestIDBytes),
+			Operation:     messages.Authenticate,
+		},
+		Payload: messages.AuthenticateInput{
 			Username: username,
 			Password: string(password),
 		},
@@ -52,7 +56,7 @@ func (c *HTTPClient) Authenticate(
 	httpRequest, err := http.NewRequestWithContext(
 		ctx,
 		http.MethodPost,
-		c.baseURL+"/auth/login",
+		c.baseURL+messages.LoginPath,
 		bytes.NewReader(body),
 	)
 	if err != nil {
@@ -67,20 +71,20 @@ func (c *HTTPClient) Authenticate(
 	}
 	defer response.Body.Close()
 
-	var result authenticateResponse
+	var result messages.Response[messages.AuthenticateResult]
 
 	if err := json.NewDecoder(response.Body).Decode(&result); err != nil {
 		return Session{}, fmt.Errorf("decode authentication response: %w", err)
 	}
 
-	if result.SchemaVersion != 1 ||
+	if result.SchemaVersion != messages.SchemaVersion ||
 		result.RequestID != request.RequestID ||
 		result.Operation != request.Operation {
 		return Session{}, fmt.Errorf("invalid authentication response envelope")
 	}
 
 	switch result.Status {
-	case "error":
+	case messages.StatusError:
 		if result.Error == nil || result.Payload != nil || result.Error.Code == "" {
 			return Session{}, fmt.Errorf("invalid authentication error response")
 		}
@@ -88,7 +92,7 @@ func (c *HTTPClient) Authenticate(
 			Code: result.Error.Code,
 		}
 
-	case "success":
+	case messages.StatusSuccess:
 		if response.StatusCode != http.StatusOK {
 			return Session{}, fmt.Errorf(
 				"unexpected authentication HTTP status: %d",
@@ -123,10 +127,13 @@ func (c *HTTPClient) List(
 	if _, err := rand.Read(requestIDBytes); err != nil {
 		return DocumentPage{}, fmt.Errorf("generate request ID: %w", err)
 	}
-	request := documentListRequest{
-		SchemaVersion: 1,
-		RequestID:     hex.EncodeToString(requestIDBytes),
-		Operation:     "ListDocuments",
+	request := messages.Request[messages.ListDocumentsInput]{
+		Envelope: messages.Envelope{
+			SchemaVersion: messages.SchemaVersion,
+			RequestID:     hex.EncodeToString(requestIDBytes),
+			Operation:     messages.ListDocuments,
+		},
+		Payload: messages.ListDocumentsInput{Page: &messages.PageInput{}},
 	}
 
 	body, err := json.Marshal(request)
@@ -137,7 +144,7 @@ func (c *HTTPClient) List(
 	httpRequest, err := http.NewRequestWithContext(
 		ctx,
 		http.MethodPost,
-		c.baseURL+"/document/list",
+		c.baseURL+messages.ListDocumentsPath,
 		bytes.NewReader(body),
 	)
 	if err != nil {
@@ -153,25 +160,25 @@ func (c *HTTPClient) List(
 	}
 	defer response.Body.Close()
 
-	var result documentListResponse
+	var result messages.Response[messages.ListDocumentsResult]
 
 	if err := json.NewDecoder(response.Body).Decode(&result); err != nil {
 		return DocumentPage{}, fmt.Errorf("decode document list response: %w", err)
 	}
 
-	if result.SchemaVersion != 1 ||
+	if result.SchemaVersion != messages.SchemaVersion ||
 		result.RequestID != request.RequestID ||
 		result.Operation != request.Operation {
 		return DocumentPage{}, fmt.Errorf("invalid document list response envelope")
 	}
 
 	switch result.Status {
-	case "error":
+	case messages.StatusError:
 		if result.Error == nil || result.Payload != nil || result.Error.Code == "" {
 			return DocumentPage{}, fmt.Errorf("invalid document list error response")
 		}
 		return DocumentPage{}, &APIError{Code: result.Error.Code}
-	case "success":
+	case messages.StatusSuccess:
 		if response.StatusCode != http.StatusOK {
 			return DocumentPage{}, fmt.Errorf("unexpected document list HTTP status: %d", response.StatusCode)
 		}
@@ -193,11 +200,13 @@ func (c *HTTPClient) Read(
 	if _, err := rand.Read(requestIDBytes); err != nil {
 		return Document{}, fmt.Errorf("generate request ID: %w", err)
 	}
-	request := documentReadRequest{
-		SchemaVersion: 1,
-		RequestID:     hex.EncodeToString(requestIDBytes),
-		Operation:     "GetDocument",
-		Payload:       documentReadPayload{DocumentID: documentID},
+	request := messages.Request[messages.GetDocumentInput]{
+		Envelope: messages.Envelope{
+			SchemaVersion: messages.SchemaVersion,
+			RequestID:     hex.EncodeToString(requestIDBytes),
+			Operation:     messages.GetDocument,
+		},
+		Payload: messages.GetDocumentInput{DocumentID: documentID},
 	}
 
 	body, err := json.Marshal(request)
@@ -208,7 +217,7 @@ func (c *HTTPClient) Read(
 	httpRequest, err := http.NewRequestWithContext(
 		ctx,
 		http.MethodPost,
-		c.baseURL+"/document/read",
+		c.baseURL+messages.GetDocumentPath,
 		bytes.NewReader(body),
 	)
 	if err != nil {
@@ -224,25 +233,25 @@ func (c *HTTPClient) Read(
 	}
 	defer response.Body.Close()
 
-	var result documentReadResponse
+	var result messages.Response[messages.GetDocumentResult]
 
 	if err := json.NewDecoder(response.Body).Decode(&result); err != nil {
 		return Document{}, fmt.Errorf("decode document read response: %w", err)
 	}
 
-	if result.SchemaVersion != 1 ||
+	if result.SchemaVersion != messages.SchemaVersion ||
 		result.RequestID != request.RequestID ||
 		result.Operation != request.Operation {
 		return Document{}, fmt.Errorf("invalid document read response envelope")
 	}
 
 	switch result.Status {
-	case "error":
+	case messages.StatusError:
 		if result.Error == nil || result.Payload != nil || result.Error.Code == "" {
 			return Document{}, fmt.Errorf("invalid document read error response")
 		}
 		return Document{}, &APIError{Code: result.Error.Code}
-	case "success":
+	case messages.StatusSuccess:
 		if response.StatusCode != http.StatusOK {
 			return Document{}, fmt.Errorf("unexpected document read HTTP status: %d", response.StatusCode)
 		}
