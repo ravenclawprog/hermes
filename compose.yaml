@@ -1,0 +1,19 @@
+services:
+  postgres:
+    image: postgres:15
+    environment:
+      POSTGRES_DB: hermes
+      POSTGRES_USER: hermes
+      POSTGRES_PASSWORD: hermes-local
+    ports:
+      - "127.0.0.1:54329:5432"
+    volumes:
+      - hermes-postgres:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -h 127.0.0.1 -U hermes -d hermes"]
+      interval: 2s
+      timeout: 3s
+      retries: 15
+
+volumes:
+  hermes-postgres:

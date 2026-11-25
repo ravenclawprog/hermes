@@ -3,3 +3,5 @@
 **/go.sum
 
 /.env
+
+!/apps/hermes-ds/go.sum

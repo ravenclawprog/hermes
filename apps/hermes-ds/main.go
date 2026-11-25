@@ -22,9 +22,21 @@ func main() {
 }
 
 func run() error {
-	service, err := app.NewDemo(os.Getenv("HERMES_DS_DEMO_PASSWORD"))
+	service, err := app.NewLocalService(os.Getenv("HERMES_DS_DEMO_PASSWORD"))
 	if err != nil {
 		return err
+	}
+
+	handler := api.New(service, service)
+	if dsn := os.Getenv("HERMES_DS_DATABASE_URL"); dsn != "" {
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		store, err := app.NewPostgres(ctx, dsn)
+		cancel()
+		if err != nil {
+			return err
+		}
+		defer store.Close()
+		handler = api.New(service, store)
 	}
 
 	port := os.Getenv("HERMES_DS_PORT")
@@ -38,7 +50,7 @@ func run() error {
 	defer listener.Close()
 
 	server := &http.Server{
-		Handler: api.LogRequests(api.New(service)),
+		Handler: api.LogRequests(handler),
 		ConnState: func(conn net.Conn, state http.ConnState) {
 			if state == http.StateNew || state == http.StateClosed {
 				log.Printf("connection %s %s", conn.RemoteAddr(), state)
@@ -52,7 +64,7 @@ func run() error {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	log.Printf("hermes-ds demo listening at http://%s", listener.Addr())
+	log.Printf("hermes-ds listening at http://%s", listener.Addr())
 	result := make(chan error, 1)
 	go func() { result <- server.Serve(listener) }()
 

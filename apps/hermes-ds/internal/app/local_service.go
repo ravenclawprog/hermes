@@ -1,6 +1,7 @@
 package app
 
 import (
+	"context"
 	"crypto/pbkdf2"
 	"crypto/rand"
 	"crypto/sha256"
@@ -22,8 +23,8 @@ const (
 	sessionTTL         = time.Hour
 )
 
-// Demo holds one local account and its personal workspace.
-type Demo struct {
+// LocalService manages the local account and sessions and provides an in-memory document.
+type LocalService struct {
 	salt         []byte
 	passwordHash []byte
 	document     messages.Document
@@ -32,7 +33,7 @@ type Demo struct {
 	sessions map[[sha256.Size]byte]time.Time
 }
 
-func NewDemo(password string) (*Demo, error) {
+func NewLocalService(password string) (*LocalService, error) {
 	if password == "" {
 		return nil, errors.New("set HERMES_DS_DEMO_PASSWORD")
 	}
@@ -45,7 +46,7 @@ func NewDemo(password string) (*Demo, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &Demo{
+	return &LocalService{
 		salt: salt, passwordHash: hash,
 		sessions: make(map[[sha256.Size]byte]time.Time),
 		document: messages.Document{
@@ -57,12 +58,12 @@ func NewDemo(password string) (*Demo, error) {
 	}, nil
 }
 
-func (d *Demo) Authenticate(username, password string) (messages.AuthenticateResult, error) {
-	hash, err := pbkdf2.Key(sha256.New, password, d.salt, passwordIterations, sha256.Size)
+func (s *LocalService) Authenticate(username, password string) (messages.AuthenticateResult, error) {
+	hash, err := pbkdf2.Key(sha256.New, password, s.salt, passwordIterations, sha256.Size)
 	if err != nil {
 		return messages.AuthenticateResult{}, err
 	}
-	if subtle.ConstantTimeCompare(hash, d.passwordHash) != 1 || !strings.EqualFold(username, "demo") {
+	if subtle.ConstantTimeCompare(hash, s.passwordHash) != 1 || !strings.EqualFold(username, "demo") {
 		return messages.AuthenticateResult{}, ErrUnauthenticated
 	}
 	rawToken := make([]byte, 32)
@@ -71,41 +72,44 @@ func (d *Demo) Authenticate(username, password string) (messages.AuthenticateRes
 	}
 	token := hex.EncodeToString(rawToken)
 
-	d.mu.Lock()
-	defer d.mu.Unlock()
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	now := time.Now().UTC()
-	for key, expiry := range d.sessions {
+	for key, expiry := range s.sessions {
 		if !now.Before(expiry) {
-			delete(d.sessions, key)
+			delete(s.sessions, key)
 		}
 	}
 	expiresAt := now.Add(sessionTTL)
-	d.sessions[sha256.Sum256([]byte(token))] = expiresAt
+	s.sessions[sha256.Sum256([]byte(token))] = expiresAt
 	return messages.AuthenticateResult{UserID: demoUserID, Token: token, ExpiresAt: expiresAt}, nil
 }
 
-func (d *Demo) ValidSession(token string) bool {
-	d.mu.Lock()
-	defer d.mu.Unlock()
+func (s *LocalService) ValidSession(token string) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	key := sha256.Sum256([]byte(token))
-	expiry, exists := d.sessions[key]
+	expiry, exists := s.sessions[key]
 	if exists && time.Now().Before(expiry) {
 		return true
 	}
-	delete(d.sessions, key)
+	delete(s.sessions, key)
 	return false
 }
 
-func (d *Demo) ListDocuments(workspaceID string) ([]messages.DocumentSummary, bool) {
-	if workspaceID != "" && workspaceID != d.document.WorkspaceID {
-		return nil, false
+func (s *LocalService) ListDocuments(_ context.Context, workspaceID, after string, _ int) ([]messages.DocumentSummary, bool, error) {
+	if workspaceID != "" && workspaceID != s.document.WorkspaceID {
+		return nil, false, nil
 	}
-	return []messages.DocumentSummary{d.document.DocumentSummary}, true
+	if after != "" {
+		return []messages.DocumentSummary{}, true, nil
+	}
+	return []messages.DocumentSummary{s.document.DocumentSummary}, true, nil
 }
 
-func (d *Demo) GetDocument(id string) (messages.Document, bool) {
-	if id != d.document.ID {
-		return messages.Document{}, false
+func (s *LocalService) GetDocument(_ context.Context, id string) (messages.Document, bool, error) {
+	if id != s.document.ID {
+		return messages.Document{}, false, nil
 	}
-	return d.document, true
+	return s.document, true, nil
 }
